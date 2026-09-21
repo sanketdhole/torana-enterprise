@@ -1,67 +1,43 @@
-# torana-enterprise
+# Torana Enterprise AI Gateway (`gateway-data`)
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+High-performance, stateless data plane for the Torana Enterprise AI Gateway written in Go (1.25+).
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
+## Architecture Highlights
 
-## Running the application in dev mode
+- **Stateless Container**: Zero local storage dependencies. Bootstrapped with flags/env only.
+- **Dynamic Atomic Snapshots**: Configuration (routes, policies, upstreams) arrives as signed snapshots and is swapped at runtime via `atomic.Pointer` with zero downtime and zero locks on the hot path.
+- **Data Privacy by Design**: Customer payloads (prompts, embeddings, completions) never leave the local customer deployment. Only sanitized metadata is streamed to the platform control plane.
+- **Streaming First**: Native streaming chunks with zero body buffering unless explicit `BodyModeBuffered` is declared by a filter.
+- **Multi-Protocol**: Ingress (HTTP, gRPC, WebSocket, MCP, A2A) and Egress (HTTP, gRPC, Postgres, internal LLMs, MCP) behind small, clean Go interfaces.
 
-You can run your application in dev mode that enables live coding using:
+## Getting Started
 
-```shell script
-./gradlew quarkusDev
+### Running Locally
+
+```bash
+# Run data plane
+go run ./cmd/gateway
+
+# Or using Makefile
+make run
 ```
 
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
+### Running Tests & Benchmarks
 
-## Packaging and running the application
+```bash
+# Run unit tests with race detection
+go test -v -race ./...
 
-The application can be packaged using:
-
-```shell script
-./gradlew build
+# Run hot-path benchmarks
+go test -bench=. -benchmem ./...
 ```
 
-It produces the `quarkus-run.jar` file in the `build/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `build/quarkus-app/lib/` directory.
+### Docker
 
-The application is now runnable using `java -jar build/quarkus-app/quarkus-run.jar`.
+```bash
+# Build Docker image
+make docker-build
 
-If you want to build an _über-jar_, execute the following command:
-
-```shell script
-./gradlew build -Dquarkus.package.jar.type=uber-jar
+# Run container
+docker run -p 8080:8080 gateway-data:latest
 ```
-
-The application, packaged as an _über-jar_, is now runnable using `java -jar build/*-runner.jar`.
-
-## Creating a native executable
-
-You can create a native executable using:
-
-```shell script
-./gradlew build -Dquarkus.native.enabled=true
-```
-
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
-
-```shell script
-./gradlew build -Dquarkus.native.enabled=true -Dquarkus.native.container-build=true
-```
-
-You can then execute your native executable with: `./build/torana-enterprise-1.0.0-SNAPSHOT-runner`
-
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/gradle-tooling>.
-
-## Related Guides
-
-- REST ([guide](https://quarkus.io/guides/rest)): Build RESTful web services and APIs using Jakarta REST (formerly JAX-RS)
-- REST Jackson ([guide](https://quarkus.io/guides/rest#json-serialisation)): Jackson serialization support for Quarkus REST. This extension is not compatible with the quarkus-resteasy extension, or any of the extensions that depend on it
-
-## Provided Code
-
-### REST
-
-Easily start your REST Web Services
-
-[Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
