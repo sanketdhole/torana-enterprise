@@ -12,10 +12,12 @@ import (
 
 	"github.com/phaselume/torana/internal/config"
 	"github.com/phaselume/torana/internal/egress"
+	"github.com/phaselume/torana/internal/ingress/a2a"
+	"github.com/phaselume/torana/internal/ingress/mcp"
+	"github.com/phaselume/torana/internal/ingress/ws"
 	"github.com/phaselume/torana/internal/pipeline"
 	"github.com/phaselume/torana/internal/router"
 	"github.com/phaselume/torana/internal/telemetry"
-	"github.com/phaselume/torana/internal/ingress/ws"
 )
 
 var (
@@ -32,21 +34,33 @@ type Listener interface {
 
 // HTTPListener handles incoming HTTP/1.1 & HTTP/2 ingress traffic.
 type HTTPListener struct {
-	addr      string
-	server    *http.Server
-	holder    *config.SnapshotHolder
-	egressReg *egress.Registry
-	emitter   *telemetry.Emitter
-	logger    *slog.Logger
-	chain     *pipeline.Chain
-	ready     atomic.Bool
-	routerPtr atomic.Pointer[router.Router]
-	wsHandler *ws.Handler
+	addr       string
+	server     *http.Server
+	holder     *config.SnapshotHolder
+	egressReg  *egress.Registry
+	emitter    *telemetry.Emitter
+	logger     *slog.Logger
+	chain      *pipeline.Chain
+	ready      atomic.Bool
+	routerPtr  atomic.Pointer[router.Router]
+	wsHandler  *ws.Handler
+	mcpHandler *mcp.Handler
+	a2aHandler *a2a.Handler
 }
 
 // SetWSHandler configures the WebSocket upgrade handler.
 func (l *HTTPListener) SetWSHandler(h *ws.Handler) {
 	l.wsHandler = h
+}
+
+// SetMCPHandler configures the Model Context Protocol handler.
+func (l *HTTPListener) SetMCPHandler(h *mcp.Handler) {
+	l.mcpHandler = h
+}
+
+// SetA2AHandler configures the Agent-to-Agent protocol handler.
+func (l *HTTPListener) SetA2AHandler(h *a2a.Handler) {
+	l.a2aHandler = h
 }
 
 // NewHTTPListener creates an HTTP ingress listener.
@@ -224,6 +238,20 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && l.wsHandler != nil {
 		l.wsHandler.Handle(w, r, &match, env)
 		l.emitTelemetry(env, http.StatusSwitchingProtocols, time.Since(startTime), "")
+		return
+	}
+
+	// Check for MCP protocol
+	if l.mcpHandler != nil && (match.Upstream.Protocol == "mcp" || r.Header.Get("Mcp-Session-Id") != "" || strings.HasSuffix(r.URL.Path, "/sse")) {
+		l.mcpHandler.ServeHTTP(w, r, match.Upstream, env)
+		l.emitTelemetry(env, http.StatusOK, time.Since(startTime), "")
+		return
+	}
+
+	// Check for A2A protocol
+	if l.a2aHandler != nil && (match.Upstream.Protocol == "a2a" || strings.HasPrefix(r.URL.Path, "/.well-known/agent") || strings.Contains(r.URL.Path, "/tasks") || strings.Contains(r.URL.Path, "/messages")) {
+		l.a2aHandler.ServeHTTP(w, r, match.Upstream, env)
+		l.emitTelemetry(env, http.StatusOK, time.Since(startTime), "")
 		return
 	}
 
