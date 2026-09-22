@@ -58,6 +58,8 @@ func (f *PreCheckFilter) Process(ctx context.Context, env *pipeline.Envelope) (p
 		retryAfterStr := strconv.Itoa(err.RetryAfter)
 		jsonBody := err.ToJSON()
 
+		env.Headers.Set("Retry-After", retryAfterStr)
+
 		decision := pipeline.Decision{
 			Action:     pipeline.ActionHalt,
 			StatusCode: http.StatusTooManyRequests,

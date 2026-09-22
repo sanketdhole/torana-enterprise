@@ -41,8 +41,21 @@ func (c *Chain) SetLogger(logger *slog.Logger) {
 	c.logger = logger
 }
 
+// AddFilter appends a filter to the execution chain.
+func (c *Chain) AddFilter(f Filter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.filters = append(c.filters, &filterWrapper{
+		filter: f,
+		cb:     NewCircuitBreaker(5, 10*time.Second),
+	})
+}
+
 // ExecutePhase runs all applicable filters for the specified phase under an optional latency budget.
 func (c *Chain) ExecutePhase(ctx context.Context, env *Envelope, phase Phase, budget time.Duration) (Decision, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	env.Phase = phase
 
 	phaseCtx := ctx
@@ -97,7 +110,10 @@ func (c *Chain) ExecutePhase(ctx context.Context, env *Envelope, phase Phase, bu
 			if status == 0 {
 				status = 500
 			}
-			return HaltDecision(status, err.Error()), fmt.Errorf("filter %q failed: %w", fw.filter.Name(), err)
+			halt := HaltDecision(status, err.Error())
+			halt.MutateHeaders = decision.MutateHeaders
+			halt.MutateBody = decision.MutateBody
+			return halt, fmt.Errorf("filter %q failed: %w", fw.filter.Name(), err)
 		}
 
 		fw.cb.RecordSuccess()
@@ -131,6 +147,8 @@ func (c *Chain) Execute(ctx context.Context, env *Envelope) (Decision, error) {
 
 // Filters returns a slice of all registered filters.
 func (c *Chain) Filters() []Filter {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	res := make([]Filter, 0, len(c.filters))
 	for _, fw := range c.filters {
 		res = append(res, fw.filter)

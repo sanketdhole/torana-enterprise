@@ -52,6 +52,7 @@ type LocalCounterStore struct {
 	peerProvider PeerCountProvider
 	syncPeriod   time.Duration
 	stopChan     chan struct{}
+	closeOnce    sync.Once
 	wg           sync.WaitGroup
 }
 
@@ -227,8 +228,10 @@ func (s *LocalCounterStore) Sync(_ context.Context) error {
 
 // Close gracefully stops the sync worker.
 func (s *LocalCounterStore) Close() error {
-	close(s.stopChan)
-	s.wg.Wait()
+	s.closeOnce.Do(func() {
+		close(s.stopChan)
+		s.wg.Wait()
+	})
 	return nil
 }
 

@@ -30,6 +30,7 @@ type Limiter struct {
 	reservations   map[string]*Reservation
 	reservationTTL time.Duration
 	stopChan       chan struct{}
+	closeOnce      sync.Once
 	wg             sync.WaitGroup
 }
 
@@ -75,10 +76,10 @@ func (l *Limiter) PreCheck(ctx context.Context, keys DimensionKeys, estimatedTok
 				seconds = 1
 			}
 			return nil, &RateLimitError{
-				Error:      "rate_limit_exceeded",
-				Code:       "REQUEST_RATE_LIMIT_EXCEEDED",
-				Reason:     fmt.Sprintf("request rate limit exceeded (burst %d, rate %.1f/s)", rateRule.Burst, rateRule.Rate),
-				RetryAfter: seconds,
+				ErrorMessage: "rate_limit_exceeded",
+				Code:         "REQUEST_RATE_LIMIT_EXCEEDED",
+				Reason:       fmt.Sprintf("request rate limit exceeded (burst %d, rate %.1f/s)", rateRule.Burst, rateRule.Rate),
+				RetryAfter:   seconds,
 			}
 		}
 	}
@@ -118,13 +119,13 @@ func (l *Limiter) PreCheck(ctx context.Context, keys DimensionKeys, estimatedTok
 				}
 
 				return nil, &RateLimitError{
-					Error:      "token_budget_exceeded",
-					Code:       "TOKEN_BUDGET_EXCEEDED",
-					Reason:     reason,
-					Window:     string(window),
-					RetryAfter: retrySeconds,
-					Limit:      limit,
-					Remaining:  0,
+					ErrorMessage: "token_budget_exceeded",
+					Code:         "TOKEN_BUDGET_EXCEEDED",
+					Reason:       reason,
+					Window:       string(window),
+					RetryAfter:   retrySeconds,
+					Limit:        limit,
+					Remaining:    0,
 				}
 			}
 
@@ -239,11 +240,13 @@ func (l *Limiter) staleReservationCleaner() {
 
 // Close cleans up limiter resources.
 func (l *Limiter) Close() error {
-	close(l.stopChan)
-	l.wg.Wait()
-	if l.store != nil {
-		return l.store.Close()
-	}
+	l.closeOnce.Do(func() {
+		close(l.stopChan)
+		l.wg.Wait()
+		if l.store != nil {
+			_ = l.store.Close()
+		}
+	})
 	return nil
 }
 
