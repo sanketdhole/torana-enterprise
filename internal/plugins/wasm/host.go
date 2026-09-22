@@ -87,6 +87,9 @@ func RegisterHostFunctions(ctx context.Context, r wazero.Runtime, manifest *Plug
 	if env.Metrics == nil {
 		env.Metrics = NoopMetricRecorder{}
 	}
+	if env.Logger == nil {
+		env.Logger = slog.Default()
+	}
 
 	modules := []string{"torana:host", "env"}
 	for _, modName := range modules {
