@@ -1,4 +1,4 @@
-package ingress
+package ingress_test
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/phaselume/torana/internal/config"
 	"github.com/phaselume/torana/internal/egress"
+	"github.com/phaselume/torana/internal/ingress"
 	"github.com/phaselume/torana/internal/pipeline"
 	"github.com/phaselume/torana/internal/router"
 	"github.com/phaselume/torana/internal/telemetry"
@@ -43,7 +44,7 @@ func (t *testSink) SendBatch(_ context.Context, events []telemetry.Event) error 
 	return nil
 }
 
-func setupTestListener() (*HTTPListener, *testSink) {
+func setupTestListener() (*ingress.HTTPListener, *testSink) {
 	cfg := &config.BootstrapConfig{
 		ListenHTTP: ":8080",
 	}
@@ -86,7 +87,7 @@ func setupTestListener() (*HTTPListener, *testSink) {
 
 	chain := pipeline.NewChain()
 
-	listener := NewHTTPListener(cfg, holder, egressReg, emitter, chain, logger)
+	listener := ingress.NewHTTPListener(cfg, holder, egressReg, emitter, chain, logger)
 	listener.UpdateRouter(rtr)
 	listener.SetReady(true)
 
@@ -100,7 +101,7 @@ func TestHTTPListener_HealthAndReady(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 		rec := httptest.NewRecorder()
 
-		listener.server.Handler.ServeHTTP(rec, req)
+		listener.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected status 200, got %d", rec.Code)
@@ -115,14 +116,14 @@ func TestHTTPListener_HealthAndReady(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 		rec := httptest.NewRecorder()
 
-		listener.server.Handler.ServeHTTP(rec, req)
+		listener.ServeHTTP(rec, req)
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("expected status 503 when not ready, got %d", rec.Code)
 		}
 
 		listener.SetReady(true)
 		rec = httptest.NewRecorder()
-		listener.server.Handler.ServeHTTP(rec, req)
+		listener.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected status 200 when ready, got %d", rec.Code)
 		}
@@ -137,7 +138,7 @@ func TestHTTPListener_ServeGatewayRequest(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
-	listener.server.Handler.ServeHTTP(rec, req)
+	listener.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d; body=%s", rec.Code, rec.Body.String())
@@ -158,7 +159,7 @@ func TestHTTPListener_RouteNotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/nonexistent", nil)
 	rec := httptest.NewRecorder()
 
-	listener.server.Handler.ServeHTTP(rec, req)
+	listener.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected status 404, got %d", rec.Code)
@@ -176,7 +177,7 @@ func BenchmarkHTTPListener_HotPath(b *testing.B) {
 		for pb.Next() {
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 			rec := httptest.NewRecorder()
-			listener.server.Handler.ServeHTTP(rec, req)
+			listener.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
 				b.Fatalf("expected status 200, got %d", rec.Code)
 			}

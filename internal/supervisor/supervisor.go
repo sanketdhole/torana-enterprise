@@ -43,6 +43,7 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 
 	// Pipeline filter chain
 	chain := pipeline.NewChain()
+	chain.SetLogger(logger)
 
 	httpLsnr := ingress.NewHTTPListener(cfg, holder, egressReg, emitter, chain, logger)
 
@@ -55,24 +56,33 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 		httpLsnr:  httpLsnr,
 	}
 
-	// Check if a static bootstrap bundle file is provided
+	// 1. Check if a static bootstrap bundle file is provided
 	if cfg.ConfigBundle != "" {
 		snap, err := config.LoadBundleFromFile(cfg.ConfigBundle)
 		if err != nil {
-			logger.Warn("failed to load initial config bundle, starting unready", "path", cfg.ConfigBundle, "error", err)
+			logger.Warn("failed to load initial config bundle", "path", cfg.ConfigBundle, "error", err)
+			httpLsnr.SetReady(false)
+		} else if err := sup.UpdateSnapshot(snap); err != nil {
+			logger.Warn("failed to apply initial config bundle", "error", err)
 			httpLsnr.SetReady(false)
 		} else {
-			_ = holder.Store(snap)
-			httpLsnr.UpdateRouter(router.Compile(snap))
-			httpLsnr.SetReady(true)
 			logger.Info("loaded bootstrap config bundle", "path", cfg.ConfigBundle, "version", snap.Version)
 		}
+	} else if cfg.LKGPath != "" {
+		// 2. Attempt to load Last-Known-Good snapshot from disk fallback if platform is unreachable
+		lkgSnap, err := config.LoadLKG(cfg.LKGPath)
+		if err == nil && lkgSnap != nil {
+			if err := sup.UpdateSnapshot(lkgSnap); err == nil {
+				logger.Info("recovered from Last-Known-Good snapshot on disk", "path", cfg.LKGPath, "version", lkgSnap.Version)
+			}
+		} else {
+			httpLsnr.SetReady(false)
+		}
 	} else {
-		// Starts not ready until config snapshot arrives via control plane stream
 		httpLsnr.SetReady(false)
 	}
 
-	// If PlatformURL is configured, initialize control plane client
+	// 3. If PlatformURL is configured, initialize control plane client
 	if cfg.PlatformURL != "" {
 		sup.cpClient = controlplane.NewClient(cfg, sup, logger)
 	}
@@ -80,8 +90,22 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 	return sup
 }
 
+// Holder returns the snapshot holder.
+func (s *Supervisor) Holder() *config.SnapshotHolder {
+	return s.holder
+}
+
+// HTTPListener returns the HTTP ingress listener.
+func (s *Supervisor) HTTPListener() *ingress.HTTPListener {
+	return s.httpLsnr
+}
+
 // UpdateSnapshot applies a new configuration snapshot atomically across the data plane.
 func (s *Supervisor) UpdateSnapshot(snap *config.Snapshot) error {
+	if err := snap.Validate(); err != nil {
+		return fmt.Errorf("snapshot validation failed: %w", err)
+	}
+
 	if err := s.holder.Store(snap); err != nil {
 		return fmt.Errorf("failed to store snapshot: %w", err)
 	}
@@ -89,6 +113,13 @@ func (s *Supervisor) UpdateSnapshot(snap *config.Snapshot) error {
 	compiledRouter := router.Compile(snap)
 	s.httpLsnr.UpdateRouter(compiledRouter)
 	s.httpLsnr.SetReady(true)
+
+	// Persist LKG snapshot to disk
+	if s.cfg.LKGPath != "" {
+		if err := config.SaveLKG(s.cfg.LKGPath, snap); err != nil {
+			s.logger.Warn("failed to persist last-known-good snapshot to disk", "path", s.cfg.LKGPath, "error", err)
+		}
+	}
 
 	s.logger.Info("applied configuration snapshot",
 		"version", snap.Version,

@@ -1,4 +1,4 @@
-package supervisor
+package supervisor_test
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/phaselume/torana/internal/config"
+	"github.com/phaselume/torana/internal/supervisor"
 )
 
 func TestSupervisor_StartupUnreadyUntilSnapshot(t *testing.T) {
@@ -19,10 +20,10 @@ func TestSupervisor_StartupUnreadyUntilSnapshot(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	sup := New(cfg, logger)
+	sup := supervisor.New(cfg, logger)
 
 	// Verify not ready on startup when no bundle provided
-	if sup.holder.HasSnapshot() {
+	if sup.Holder().HasSnapshot() {
 		t.Errorf("expected holder to have no snapshot on startup")
 	}
 
@@ -40,11 +41,11 @@ func TestSupervisor_StartupUnreadyUntilSnapshot(t *testing.T) {
 		t.Fatalf("failed to update snapshot: %v", err)
 	}
 
-	if !sup.holder.HasSnapshot() {
+	if !sup.Holder().HasSnapshot() {
 		t.Errorf("expected holder to have snapshot after update")
 	}
 
-	loaded, err := sup.holder.Load()
+	loaded, err := sup.Holder().Load()
 	if err != nil || loaded.Version != 1 {
 		t.Fatalf("expected version 1, got %v", loaded)
 	}
@@ -70,13 +71,13 @@ func TestSupervisor_StartupWithBundle(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	sup := New(cfg, logger)
+	sup := supervisor.New(cfg, logger)
 
-	if !sup.holder.HasSnapshot() {
+	if !sup.Holder().HasSnapshot() {
 		t.Fatalf("expected supervisor to have snapshot from bundle")
 	}
 
-	loaded, err := sup.holder.Load()
+	loaded, err := sup.Holder().Load()
 	if err != nil || loaded.Version != 10 {
 		t.Fatalf("expected version 10 from bundle, got %v", loaded)
 	}
@@ -88,10 +89,10 @@ func TestSupervisor_ContextCancelShutdown(t *testing.T) {
 		DrainTimeout: 1 * time.Second,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	sup := New(cfg, logger)
+	sup := supervisor.New(cfg, logger)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	_ = sup.httpLsnr.Stop(ctx)
+	_ = sup.HTTPListener().Stop(ctx)
 }

@@ -1,4 +1,4 @@
-package telemetry
+package telemetry_test
 
 import (
 	"context"
@@ -7,14 +7,16 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/phaselume/torana/internal/telemetry"
 )
 
 type memorySink struct {
 	mu     sync.Mutex
-	events []Event
+	events []telemetry.Event
 }
 
-func (m *memorySink) SendBatch(_ context.Context, batch []Event) error {
+func (m *memorySink) SendBatch(_ context.Context, batch []telemetry.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, batch...)
@@ -31,13 +33,13 @@ func TestEmitter_BoundedQueueAndDrain(t *testing.T) {
 	sink := &memorySink{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	emitter := NewEmitter(100, sink, logger)
+	emitter := telemetry.NewEmitter(100, sink, logger)
 	ctx := context.Background()
 	emitter.Start(ctx)
 
 	// Emit 50 events
 	for i := 0; i < 50; i++ {
-		ok := emitter.Emit(Event{
+		ok := emitter.Emit(telemetry.Event{
 			RouteID:    "route-chat",
 			UpstreamID: "llm-openai",
 			StatusCode: 200,
@@ -63,11 +65,11 @@ func TestEmitter_BufferSaturationDrops(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Tiny queue size of 2, worker not started so channel stays full
-	emitter := NewEmitter(2, sink, logger)
+	emitter := telemetry.NewEmitter(2, sink, logger)
 
-	ok1 := emitter.Emit(Event{RouteID: "r1"})
-	ok2 := emitter.Emit(Event{RouteID: "r2"})
-	ok3 := emitter.Emit(Event{RouteID: "r3"}) // Should drop
+	ok1 := emitter.Emit(telemetry.Event{RouteID: "r1"})
+	ok2 := emitter.Emit(telemetry.Event{RouteID: "r2"})
+	ok3 := emitter.Emit(telemetry.Event{RouteID: "r3"}) // Should drop
 
 	if !ok1 || !ok2 {
 		t.Errorf("expected first two emits to succeed, got %v, %v", ok1, ok2)
@@ -85,12 +87,12 @@ func BenchmarkEmitter_Emit(b *testing.B) {
 	sink := &memorySink{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	emitter := NewEmitter(100000, sink, logger)
+	emitter := telemetry.NewEmitter(100000, sink, logger)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	emitter.Start(ctx)
 
-	event := Event{
+	event := telemetry.Event{
 		RouteID:    "route-chat",
 		UpstreamID: "llm-openai",
 		StatusCode: 200,

@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -81,6 +81,16 @@ func (l *HTTPListener) Protocol() string {
 	return "http"
 }
 
+// ServeHTTP implements http.Handler for testing and direct dispatch.
+func (l *HTTPListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	l.server.Handler.ServeHTTP(w, r)
+}
+
+// Server returns the underlying http.Server.
+func (l *HTTPListener) Server() *http.Server {
+	return l.server
+}
+
 // UpdateRouter atomically updates the pre-compiled router.
 func (l *HTTPListener) UpdateRouter(r *router.Router) {
 	l.routerPtr.Store(r)
@@ -127,61 +137,82 @@ func (l *HTTPListener) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"READY"}`))
 }
 
-// handleGateway processes the hot-path gateway requests.
+// handleGateway processes hot-path requests with pooled envelopes and SSE flushes.
 func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 
-	// 1. Hot path lock-free router fetch
+	// 1. Fetch pre-compiled router atomically
 	rtr := l.routerPtr.Load()
 	if rtr == nil {
 		http.Error(w, `{"error":"gateway not ready"}`, http.StatusServiceUnavailable)
 		return
 	}
 
-	// 2. Lock-free route resolution
-	match, err := rtr.Match(r.Method, r.URL.Path)
+	// 2. Extract matching criteria with zero allocations on hot path
+	criteria := router.MatchCriteria{
+		Host:   r.Host,
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Header: r.Header,
+	}
+
+	var claimsMap map[string]string
+	if claimHdr := r.Header.Get("X-Identity-Claims"); claimHdr != "" {
+		claimsMap = make(map[string]string)
+		for _, pair := range strings.Split(claimHdr, ",") {
+			parts := strings.SplitN(pair, "=", 2)
+			if len(parts) == 2 {
+				claimsMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+		criteria.Claims = claimsMap
+	}
+
+	// 3. Lock-free route resolution
+	match, err := rtr.Match(criteria)
 	if err != nil {
 		http.Error(w, `{"error":"route not found"}`, http.StatusNotFound)
 		return
 	}
 
-	// 3. Build Request Envelope
-	env := pipeline.NewEnvelope(
+	// 4. Get recycled Envelope from pool
+	env := pipeline.GetEnvelope(
 		r.Header.Get("X-Request-ID"),
 		pipeline.PhaseRequestHeaders,
 		r.Method,
 		r.URL.Path,
-		r.Header.Clone(),
+		r.Header,
 		r.Body,
 	)
+	defer pipeline.PutEnvelope(env)
+
 	env.Route = match.Route
 	env.Upstream = match.Upstream
+	env.Claims = claimsMap
 	env.PeerInfo = pipeline.PeerInfo{
 		RemoteIP: r.RemoteAddr,
 		Protocol: r.Proto,
 	}
 
-	// 4. Run Filter Chain (authn, authz, ratelimit, etc.)
+	// 5. Run Phase 1: Request Headers
 	if l.chain != nil {
-		decision, err := l.chain.Execute(r.Context(), env)
+		decision, err := l.chain.ExecutePhase(r.Context(), env, pipeline.PhaseRequestHeaders, 0)
 		if err != nil || decision.Action == pipeline.ActionHalt || decision.Action == pipeline.ActionDrop {
-			status := decision.StatusCode
-			if status == 0 {
-				status = http.StatusForbidden
-			}
-			msg := decision.Reason
-			if msg == "" && err != nil {
-				msg = err.Error()
-			}
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, msg), status)
-
-			// Emit telemetry event for rejected request
-			l.emitTelemetry(env, status, time.Since(startTime), msg)
+			l.handleHalt(w, env, decision, startTime, err)
 			return
 		}
 	}
 
-	// 5. Fetch egress client by upstream protocol
+	// 6. Run Phase 2: Request Body
+	if l.chain != nil {
+		decision, err := l.chain.ExecutePhase(r.Context(), env, pipeline.PhaseRequestBody, 0)
+		if err != nil || decision.Action == pipeline.ActionHalt || decision.Action == pipeline.ActionDrop {
+			l.handleHalt(w, env, decision, startTime, err)
+			return
+		}
+	}
+
+	// 7. Resolve Egress Client
 	egressClient, err := l.egressReg.Get(match.Upstream.Protocol)
 	if err != nil {
 		http.Error(w, `{"error":"upstream protocol unsupported"}`, http.StatusBadGateway)
@@ -189,13 +220,14 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Execute Egress invocation with streaming body
+	// 8. Egress invocation
 	egressReq := &egress.Request{
-		Method:  env.Method,
-		Path:    env.Path,
-		Headers: env.Headers,
-		Body:    env.Body,
-		Timeout: match.Route.Timeout,
+		Method:      env.Method,
+		Path:        env.Path,
+		Headers:     env.Headers,
+		Body:        env.Body,
+		Timeout:     match.Route.Timeout,
+		RetryPolicy: match.RetryPolicy,
 	}
 
 	resp, err := egressClient.Execute(r.Context(), match.Upstream, egressReq)
@@ -206,7 +238,19 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// 7. Stream response headers and body back to client
+	// 9. Run Phase 3: Response Headers
+	if l.chain != nil {
+		respEnv := pipeline.GetEnvelope(env.RequestID, pipeline.PhaseResponseHeaders, env.Method, env.Path, resp.Headers, resp.Body)
+		defer pipeline.PutEnvelope(respEnv)
+
+		decision, err := l.chain.ExecutePhase(r.Context(), respEnv, pipeline.PhaseResponseHeaders, 0)
+		if err != nil || decision.Action == pipeline.ActionHalt || decision.Action == pipeline.ActionDrop {
+			l.handleHalt(w, env, decision, startTime, err)
+			return
+		}
+	}
+
+	// 10. Copy response headers to client
 	for k, vv := range resp.Headers {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -214,10 +258,42 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	_, _ = io.Copy(w, resp.Body)
+	// 11. Streaming pass-through with flusher for SSE (text/event-stream) and chunked bodies
+	flusher, isFlusher := w.(http.Flusher)
+	isSSE := strings.Contains(resp.Headers.Get("Content-Type"), "text/event-stream")
 
-	// 8. Emit telemetry metadata
+	bufPtr := pipeline.GetBuffer()
+	defer pipeline.PutBuffer(bufPtr)
+	buf := *bufPtr
+
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if isFlusher && (isSSE || n < len(buf)) {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	// 12. Emit telemetry metadata
 	l.emitTelemetry(env, resp.StatusCode, time.Since(startTime), "")
+}
+
+func (l *HTTPListener) handleHalt(w http.ResponseWriter, env *pipeline.Envelope, d pipeline.Decision, start time.Time, err error) {
+	status := d.StatusCode
+	if status == 0 {
+		status = http.StatusForbidden
+	}
+	msg := d.Reason
+	if msg == "" && err != nil {
+		msg = err.Error()
+	}
+	http.Error(w, fmt.Sprintf(`{"error":%q}`, msg), status)
+	l.emitTelemetry(env, status, time.Since(start), msg)
 }
 
 func (l *HTTPListener) emitTelemetry(env *pipeline.Envelope, status int, duration time.Duration, errStr string) {

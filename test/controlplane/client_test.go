@@ -1,4 +1,4 @@
-package controlplane
+package controlplane_test
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 
 	controlplanev1 "github.com/phaselume/torana/api/proto/controlplane/v1"
 	"github.com/phaselume/torana/internal/config"
+	"github.com/phaselume/torana/internal/controlplane"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -128,7 +129,7 @@ func TestControlPlaneClient_StreamSnapshotAndAck(t *testing.T) {
 		Namespace:   "test-ns",
 	}
 
-	client := NewClient(cfg, consumer, logger)
+	client := controlplane.NewClient(cfg, consumer, logger)
 	client.SetPublicKey(pub)
 
 	// Dial in-memory
@@ -171,7 +172,7 @@ func TestControlPlaneClient_StreamSnapshotAndAck(t *testing.T) {
 		t.Fatalf("recv snapshot failed: %v", err)
 	}
 
-	client.handleControlMessage(stream, msg)
+	client.HandleControlMessage(stream, msg)
 
 	select {
 	case ackVer := <-ackChan:

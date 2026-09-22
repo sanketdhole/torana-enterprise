@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phaselume/torana/internal/config"
@@ -19,6 +21,10 @@ var (
 	ErrUnauthorized = errors.New("unauthorized request")
 	// ErrBodyTooLarge is returned when a buffered filter encounters a body exceeding allowed limit.
 	ErrBodyTooLarge = errors.New("request body exceeds max allowed buffer size")
+	// ErrPhaseTimeout is returned when a phase exceeds its latency budget.
+	ErrPhaseTimeout = errors.New("phase latency budget exceeded")
+	// ErrCircuitOpen is returned when a filter's circuit breaker is open.
+	ErrCircuitOpen = errors.New("filter circuit breaker open")
 )
 
 // Phase represents the lifecycle execution phase of a filter.
@@ -50,11 +56,8 @@ func (p Phase) String() string {
 type BodyMode int
 
 const (
-	// BodyModeNone indicates the filter inspects/modifies headers or metadata only without touching the body.
 	BodyModeNone BodyMode = iota
-	// BodyModeStreaming indicates the filter inspects or transforms body chunks on-the-fly without full buffering.
 	BodyModeStreaming
-	// BodyModeBuffered indicates the filter explicitly requires the complete body in memory up to a declared limit.
 	BodyModeBuffered
 )
 
@@ -69,6 +72,21 @@ func (m BodyMode) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// FailurePolicy defines whether a filter failure should halt the request or fail open.
+type FailurePolicy int
+
+const (
+	FailurePolicyFailClosed FailurePolicy = iota
+	FailurePolicyFailOpen
+)
+
+func (f FailurePolicy) String() string {
+	if f == FailurePolicyFailOpen {
+		return "fail_open"
+	}
+	return "fail_closed"
 }
 
 // Action represents the outcome decided by a Filter.
@@ -140,26 +158,84 @@ type Envelope struct {
 	Path         string
 	Headers      http.Header
 	Metadata     map[string]string
+	Claims       map[string]string
 	Body         io.Reader
 	BufferedBody []byte
 	PeerInfo     PeerInfo
 	StartTime    time.Time
 }
 
-// NewEnvelope constructs a new Envelope instance.
-func NewEnvelope(requestID string, phase Phase, method, path string, headers http.Header, body io.Reader) *Envelope {
-	if headers == nil {
-		headers = make(http.Header)
+// Reset clears fields so the Envelope can be recycled in sync.Pool.
+func (e *Envelope) Reset() {
+	e.RequestID = ""
+	e.Route = nil
+	e.Upstream = nil
+	e.Phase = 0
+	e.Method = ""
+	e.Path = ""
+	e.Body = nil
+	e.BufferedBody = nil
+	e.PeerInfo = PeerInfo{}
+	e.StartTime = time.Time{}
+	e.Headers = nil
+
+	clear(e.Metadata)
+	clear(e.Claims)
+}
+
+// EnvelopePool manages reusable Envelope instances to eliminate allocations on the hot path.
+var envelopePool = sync.Pool{
+	New: func() any {
+		return &Envelope{
+			Metadata: make(map[string]string),
+			Claims:   make(map[string]string),
+		}
+	},
+}
+
+// GetEnvelope retrieves a recycled Envelope from the pool.
+func GetEnvelope(requestID string, phase Phase, method, path string, headers http.Header, body io.Reader) *Envelope {
+	env := envelopePool.Get().(*Envelope)
+	env.Reset()
+	env.RequestID = requestID
+	env.Phase = phase
+	env.Method = method
+	env.Path = path
+	env.Body = body
+	env.StartTime = time.Now()
+
+	if headers != nil {
+		env.Headers = headers
+	} else {
+		env.Headers = make(http.Header)
 	}
-	return &Envelope{
-		RequestID: requestID,
-		Phase:     phase,
-		Method:    method,
-		Path:      path,
-		Headers:   headers,
-		Metadata:  make(map[string]string),
-		Body:      body,
-		StartTime: time.Now(),
+	return env
+}
+
+// PutEnvelope returns an Envelope to the pool for reuse.
+func PutEnvelope(env *Envelope) {
+	if env != nil {
+		envelopePool.Put(env)
+	}
+}
+
+// BufferPool manages reusable 32KB streaming chunk byte slices.
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+// GetBuffer retrieves a 32KB chunk buffer from the pool.
+func GetBuffer() *[]byte {
+	return bufferPool.Get().(*[]byte)
+}
+
+// PutBuffer returns a buffer to the pool.
+func PutBuffer(b *[]byte) {
+	if b != nil {
+		bufferPool.Put(b)
 	}
 }
 
@@ -197,11 +273,55 @@ func (e *Envelope) GetMetadata(key string) (string, bool) {
 	return val, ok
 }
 
+// CircuitBreaker tracks error states for a filter.
+type CircuitBreaker struct {
+	consecutiveFailures atomic.Int64
+	threshold           int64
+	lastFailure         atomic.Int64 // Unix nanoseconds
+	cooldown            time.Duration
+}
+
+// NewCircuitBreaker creates a circuit breaker.
+func NewCircuitBreaker(threshold int64, cooldown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		threshold: threshold,
+		cooldown:  cooldown,
+	}
+}
+
+// Allow returns true if the circuit allows execution.
+func (cb *CircuitBreaker) Allow() bool {
+	if cb.threshold <= 0 {
+		return true
+	}
+	fails := cb.consecutiveFailures.Load()
+	if fails < cb.threshold {
+		return true
+	}
+	last := time.Unix(0, cb.lastFailure.Load())
+	if time.Since(last) > cb.cooldown {
+		return true
+	}
+	return false
+}
+
+// RecordSuccess resets the circuit breaker.
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.consecutiveFailures.Store(0)
+}
+
+// RecordFailure registers a failure.
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.consecutiveFailures.Add(1)
+	cb.lastFailure.Store(time.Now().UnixNano())
+}
+
 // Filter represents a plugin or internal filter unit in the pipeline.
 type Filter interface {
 	Name() string
 	Phase() Phase
 	BodyMode() BodyMode
+	FailurePolicy() FailurePolicy
 	Process(ctx context.Context, env *Envelope) (Decision, error)
 	Close() error
 }

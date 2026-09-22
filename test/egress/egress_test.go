@@ -1,4 +1,4 @@
-package egress
+package egress_test
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/phaselume/torana/internal/config"
+	"github.com/phaselume/torana/internal/egress"
 )
 
 type roundTripFunc func(req *http.Request) *http.Response
@@ -47,11 +48,9 @@ func TestHTTPClient_Execute(t *testing.T) {
 		}
 	})
 
-	client := &HTTPClient{
-		httpClient: &http.Client{
-			Transport: mockTransport,
-		},
-	}
+	client := egress.NewHTTPClient()
+	client.SetTransportForCluster("upstream-test", mockTransport)
+	client.SetDefaultTransport(mockTransport)
 	defer func() { _ = client.Close() }()
 
 	cluster := &config.UpstreamCluster{
@@ -64,7 +63,7 @@ func TestHTTPClient_Execute(t *testing.T) {
 	headers := make(http.Header)
 	headers.Set("X-Custom-Header", "TestValue")
 
-	req := &Request{
+	req := &egress.Request{
 		Method:  http.MethodPost,
 		Path:    "/test-endpoint",
 		Headers: headers,
@@ -91,7 +90,7 @@ func TestHTTPClient_Execute(t *testing.T) {
 }
 
 func TestRegistry(t *testing.T) {
-	reg := NewRegistry()
+	reg := egress.NewRegistry()
 	defer func() { _ = reg.Close() }()
 
 	client, err := reg.Get("http")

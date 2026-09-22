@@ -230,6 +230,11 @@ func (c *Client) connectAndStream(ctx context.Context) error {
 	}
 }
 
+// HandleControlMessage processes an incoming control plane message.
+func (c *Client) HandleControlMessage(stream controlplanev1.ControlPlaneService_StreamClient, msg *controlplanev1.ControlMessage) {
+	c.handleControlMessage(stream, msg)
+}
+
 func (c *Client) handleControlMessage(stream controlplanev1.ControlPlaneService_StreamClient, msg *controlplanev1.ControlMessage) {
 	switch p := msg.Payload.(type) {
 	case *controlplanev1.ControlMessage_Snapshot:

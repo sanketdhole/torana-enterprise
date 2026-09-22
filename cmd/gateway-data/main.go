@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,30 +15,8 @@ var (
 	Version = "0.1.0-dev"
 )
 
-func parseFlags(args []string) (*config.BootstrapConfig, bool, error) {
-	fs := flag.NewFlagSet("gateway-data", flag.ContinueOnError)
-
-	cfg := config.LoadBootstrapConfig()
-
-	fs.StringVar(&cfg.Namespace, "namespace", cfg.Namespace, "Deployment namespace identity")
-	fs.StringVar(&cfg.PlatformURL, "platform-url", cfg.PlatformURL, "Platform control plane gRPC service URL")
-	fs.StringVar(&cfg.EnrollTokenFile, "enroll-token-file", cfg.EnrollTokenFile, "Path to node enrollment token file")
-	fs.StringVar(&cfg.ListenHTTP, "listen-http", cfg.ListenHTTP, "HTTP ingress listen address (default :8080)")
-	fs.StringVar(&cfg.ListenGRPC, "listen-grpc", cfg.ListenGRPC, "gRPC ingress listen address (default :9090)")
-	fs.StringVar(&cfg.PeersDNS, "peers-dns", cfg.PeersDNS, "DNS SRV / headless service name for peer discovery")
-	fs.StringVar(&cfg.ConfigBundle, "config-bundle", cfg.ConfigBundle, "Path to local static configuration bundle JSON file")
-
-	showVersion := fs.Bool("version", false, "Print binary version and exit")
-
-	if err := fs.Parse(args); err != nil {
-		return nil, false, err
-	}
-
-	return cfg, *showVersion, nil
-}
-
 func main() {
-	cfg, showVersion, err := parseFlags(os.Args[1:])
+	cfg, showVersion, err := config.ParseFlags(os.Args[1:])
 	if err != nil {
 		os.Exit(2)
 	}

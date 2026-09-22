@@ -3,39 +3,104 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
+	"time"
 )
 
-// Chain executes an ordered list of Filters.
-type Chain struct {
-	filters []Filter
+type filterWrapper struct {
+	filter Filter
+	cb     *CircuitBreaker
 }
 
-// NewChain creates a new filter execution chain.
+// Chain executes an ordered list of Filters across pipeline phases.
+type Chain struct {
+	mu      sync.RWMutex
+	filters []*filterWrapper
+	logger  *slog.Logger
+}
+
+// NewChain creates a new phase-based filter execution chain.
 func NewChain(filters ...Filter) *Chain {
+	wrapped := make([]*filterWrapper, 0, len(filters))
+	for _, f := range filters {
+		wrapped = append(wrapped, &filterWrapper{
+			filter: f,
+			cb:     NewCircuitBreaker(5, 10*time.Second),
+		})
+	}
 	return &Chain{
-		filters: filters,
+		filters: wrapped,
 	}
 }
 
-// Execute runs all applicable filters for the envelope's current phase.
-// Halts execution on the first error or ActionHalt encountered (fail-closed).
-func (c *Chain) Execute(ctx context.Context, env *Envelope) (Decision, error) {
-	for _, f := range c.filters {
+// SetLogger attaches a logger for debug and failure warnings.
+func (c *Chain) SetLogger(logger *slog.Logger) {
+	c.logger = logger
+}
+
+// ExecutePhase runs all applicable filters for the specified phase under an optional latency budget.
+func (c *Chain) ExecutePhase(ctx context.Context, env *Envelope, phase Phase, budget time.Duration) (Decision, error) {
+	env.Phase = phase
+
+	phaseCtx := ctx
+	if budget > 0 {
+		var cancel context.CancelFunc
+		phaseCtx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
+	for _, fw := range c.filters {
 		select {
-		case <-ctx.Done():
-			return HaltDecision(504, "context cancelled"), ctx.Err()
+		case <-phaseCtx.Done():
+			if errors.Is(phaseCtx.Err(), context.DeadlineExceeded) {
+				return HaltDecision(504, "phase latency budget exceeded"), ErrPhaseTimeout
+			}
+			return HaltDecision(504, "context cancelled"), phaseCtx.Err()
 		default:
 		}
 
-		if f.Phase() != env.Phase {
+		if fw.filter.Phase() != phase {
 			continue
 		}
 
-		decision, err := f.Process(ctx, env)
-		if err != nil {
-			return HaltDecision(500, err.Error()), fmt.Errorf("filter %q failed: %w", f.Name(), err)
+		// Check circuit breaker
+		if !fw.cb.Allow() {
+			if fw.filter.FailurePolicy() == FailurePolicyFailOpen {
+				if c.logger != nil {
+					c.logger.Warn("filter circuit breaker open, failing open", "filter", fw.filter.Name(), "phase", phase.String())
+				}
+				continue
+			}
+			return HaltDecision(503, "filter circuit breaker open"), ErrCircuitOpen
 		}
+
+		decision, err := fw.filter.Process(phaseCtx, env)
+		if err != nil {
+			fw.cb.RecordFailure()
+
+			// Check if phase budget/context timed out
+			if errors.Is(phaseCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				return HaltDecision(504, "phase latency budget exceeded"), ErrPhaseTimeout
+			}
+
+			if fw.filter.FailurePolicy() == FailurePolicyFailOpen {
+				if c.logger != nil {
+					c.logger.Warn("filter execution failed, failing open", "filter", fw.filter.Name(), "error", err)
+				}
+				continue
+			}
+
+			status := decision.StatusCode
+			if status == 0 {
+				status = 500
+			}
+			return HaltDecision(status, err.Error()), fmt.Errorf("filter %q failed: %w", fw.filter.Name(), err)
+		}
+
+		fw.cb.RecordSuccess()
 
 		// Apply mutations if any
 		if decision.Action == ActionMutate {
@@ -59,7 +124,16 @@ func (c *Chain) Execute(ctx context.Context, env *Envelope) (Decision, error) {
 	return ContinueDecision(), nil
 }
 
-// Filters returns a slice of all configured filters.
+// Execute is a convenience method executing PhaseRequestHeaders.
+func (c *Chain) Execute(ctx context.Context, env *Envelope) (Decision, error) {
+	return c.ExecutePhase(ctx, env, PhaseRequestHeaders, 0)
+}
+
+// Filters returns a slice of all registered filters.
 func (c *Chain) Filters() []Filter {
-	return c.filters
+	res := make([]Filter, 0, len(c.filters))
+	for _, fw := range c.filters {
+		res = append(res, fw.filter)
+	}
+	return res
 }

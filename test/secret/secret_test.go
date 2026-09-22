@@ -1,4 +1,4 @@
-package secret
+package secret_test
 
 import (
 	"context"
@@ -7,13 +7,14 @@ import (
 	"testing"
 
 	"github.com/phaselume/torana/internal/config"
+	"github.com/phaselume/torana/internal/secret"
 )
 
 func TestEnvResolver_Resolve(t *testing.T) {
 	_ = os.Setenv("TEST_API_KEY", "sk-live-1234567890abcdef")
 	defer func() { _ = os.Unsetenv("TEST_API_KEY") }()
 
-	resolver := NewEnvResolver()
+	resolver := secret.NewEnvResolver()
 	ctx := context.Background()
 
 	tests := []struct {
@@ -39,7 +40,7 @@ func TestEnvResolver_Resolve(t *testing.T) {
 				Key:      "NON_EXISTENT_KEY",
 			},
 			expectError:   true,
-			expectedErrIs: ErrSecretNotFound,
+			expectedErrIs: secret.ErrSecretNotFound,
 		},
 		{
 			name: "unsupported provider",
@@ -48,7 +49,7 @@ func TestEnvResolver_Resolve(t *testing.T) {
 				Key:      "TEST_API_KEY",
 			},
 			expectError:   true,
-			expectedErrIs: ErrUnsupportedProvider,
+			expectedErrIs: secret.ErrUnsupportedProvider,
 		},
 	}
 
@@ -86,7 +87,7 @@ func TestMask(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := Mask(tt.input)
+		got := secret.Mask(tt.input)
 		if got != tt.expected {
 			t.Errorf("Mask(%s) = %s; want %s", tt.input, got, tt.expected)
 		}
