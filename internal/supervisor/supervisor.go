@@ -13,6 +13,9 @@ import (
 	"github.com/phaselume/torana/internal/controlplane"
 	"github.com/phaselume/torana/internal/egress"
 	"github.com/phaselume/torana/internal/ingress"
+	egressgrpc "github.com/phaselume/torana/internal/egress/grpc"
+	ingressgrpc "github.com/phaselume/torana/internal/ingress/grpc"
+	"github.com/phaselume/torana/internal/ingress/ws"
 	"github.com/phaselume/torana/internal/pipeline"
 	"github.com/phaselume/torana/internal/router"
 	"github.com/phaselume/torana/internal/security/authn"
@@ -23,15 +26,17 @@ import (
 
 // Supervisor orchestrates all background tasks, listeners, and graceful shutdown.
 type Supervisor struct {
-	cfg       *config.BootstrapConfig
-	logger    *slog.Logger
-	holder    *config.SnapshotHolder
-	egressReg *egress.Registry
-	emitter   *telemetry.Emitter
-	httpLsnr  *ingress.HTTPListener
-	cpClient  *controlplane.Client
-	revList   *authn.RevocationList
-	wg        sync.WaitGroup
+	cfg        *config.BootstrapConfig
+	logger     *slog.Logger
+	holder     *config.SnapshotHolder
+	egressReg  *egress.Registry
+	grpcEgress *egressgrpc.Client
+	emitter    *telemetry.Emitter
+	httpLsnr   *ingress.HTTPListener
+	grpcLsnr   *ingressgrpc.Listener
+	cpClient   *controlplane.Client
+	revList    *authn.RevocationList
+	wg         sync.WaitGroup
 }
 
 // New creates a new Supervisor instance.
@@ -44,6 +49,8 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 
 	// Egress registry
 	egressReg := egress.NewRegistry()
+	grpcEgress := egressgrpc.NewClient()
+	egressReg.Register("grpc", grpcEgress)
 
 	// Revocation list
 	revList := authn.NewRevocationList()
@@ -53,15 +60,21 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 	chain.SetLogger(logger)
 
 	httpLsnr := ingress.NewHTTPListener(cfg, holder, egressReg, emitter, chain, logger)
+	wsHandler := ws.NewHandler(ws.DefaultOptions(), chain, revList, logger)
+	httpLsnr.SetWSHandler(wsHandler)
+
+	grpcLsnr := ingressgrpc.NewListener(cfg, holder, egressReg, grpcEgress, chain, logger)
 
 	sup := &Supervisor{
-		cfg:       cfg,
-		logger:    logger,
-		holder:    holder,
-		egressReg: egressReg,
-		emitter:   emitter,
-		httpLsnr:  httpLsnr,
-		revList:   revList,
+		cfg:        cfg,
+		logger:     logger,
+		holder:     holder,
+		egressReg:  egressReg,
+		grpcEgress: grpcEgress,
+		emitter:    emitter,
+		httpLsnr:   httpLsnr,
+		grpcLsnr:   grpcLsnr,
+		revList:    revList,
 	}
 
 	// 1. Check if a static bootstrap bundle file is provided
@@ -108,6 +121,11 @@ func (s *Supervisor) HTTPListener() *ingress.HTTPListener {
 	return s.httpLsnr
 }
 
+// GRPCListener returns the gRPC ingress listener.
+func (s *Supervisor) GRPCListener() *ingressgrpc.Listener {
+	return s.grpcLsnr
+}
+
 // UpdateSnapshot applies a new configuration snapshot atomically across the data plane.
 func (s *Supervisor) UpdateSnapshot(snap *config.Snapshot) error {
 	if err := snap.Validate(); err != nil {
@@ -121,6 +139,10 @@ func (s *Supervisor) UpdateSnapshot(snap *config.Snapshot) error {
 	compiledRouter := router.Compile(snap)
 	s.httpLsnr.UpdateRouter(compiledRouter)
 	s.httpLsnr.SetReady(true)
+	if s.grpcLsnr != nil {
+		s.grpcLsnr.UpdateRouter(compiledRouter)
+		s.grpcLsnr.SetReady(true)
+	}
 
 	// Persist LKG snapshot to disk
 	if s.cfg.LKGPath != "" {
@@ -182,6 +204,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Start gRPC Ingress listener in managed goroutine
+	if s.grpcLsnr != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if err := s.grpcLsnr.Start(ctx); err != nil {
+				serverErr <- err
+			}
+		}()
+	}
+
 	s.logger.Info("torana data plane initialized",
 		"namespace", s.cfg.Namespace,
 		"http_addr", s.cfg.HTTPAddress(),
@@ -205,9 +238,14 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), s.cfg.DrainTimeout)
 	defer drainCancel()
 
-	// 1. Mark unready & stop HTTP listener
+	// 1. Mark unready & stop HTTP and gRPC listeners
 	if err := s.httpLsnr.Stop(drainCtx); err != nil {
 		s.logger.Error("error stopping http listener", "error", err)
+	}
+	if s.grpcLsnr != nil {
+		if err := s.grpcLsnr.Stop(drainCtx); err != nil {
+			s.logger.Error("error stopping grpc listener", "error", err)
+		}
 	}
 
 	// 2. Wait for ingress goroutine

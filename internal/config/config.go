@@ -121,6 +121,9 @@ func (b *BootstrapConfig) HTTPAddress() string {
 
 // GRPCAddress returns the listen address for the gRPC ingress.
 func (b *BootstrapConfig) GRPCAddress() string {
+	if b.ListenGRPC == "" {
+		return ":9090"
+	}
 	return b.ListenGRPC
 }
 

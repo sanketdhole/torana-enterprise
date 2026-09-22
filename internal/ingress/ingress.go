@@ -15,6 +15,7 @@ import (
 	"github.com/phaselume/torana/internal/pipeline"
 	"github.com/phaselume/torana/internal/router"
 	"github.com/phaselume/torana/internal/telemetry"
+	"github.com/phaselume/torana/internal/ingress/ws"
 )
 
 var (
@@ -40,6 +41,12 @@ type HTTPListener struct {
 	chain     *pipeline.Chain
 	ready     atomic.Bool
 	routerPtr atomic.Pointer[router.Router]
+	wsHandler *ws.Handler
+}
+
+// SetWSHandler configures the WebSocket upgrade handler.
+func (l *HTTPListener) SetWSHandler(h *ws.Handler) {
+	l.wsHandler = h
 }
 
 // NewHTTPListener creates an HTTP ingress listener.
@@ -211,6 +218,13 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 			l.handleHalt(w, env, decision, startTime, err)
 			return
 		}
+	}
+
+	// Check for WebSocket upgrade
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && l.wsHandler != nil {
+		l.wsHandler.Handle(w, r, &match, env)
+		l.emitTelemetry(env, http.StatusSwitchingProtocols, time.Since(startTime), "")
+		return
 	}
 
 	// 6. Run Phase 2: Request Body

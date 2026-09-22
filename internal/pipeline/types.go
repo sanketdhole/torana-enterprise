@@ -332,3 +332,9 @@ type Filter interface {
 	Process(ctx context.Context, env *Envelope) (Decision, error)
 	Close() error
 }
+
+// ChunkHook represents a filter that inspects or mutates individual streaming chunks or messages.
+type ChunkHook interface {
+	OnChunk(ctx context.Context, env *Envelope, chunk []byte) ([]byte, error)
+}
+

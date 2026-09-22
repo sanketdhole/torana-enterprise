@@ -8,16 +8,27 @@ import (
 
 // RevocationList manages revoked tokens and credentials with O(1) lock-optimized lookup.
 type RevocationList struct {
-	mu     sync.RWMutex
-	tokens map[string]struct{}
-	keys   map[string]struct{}
+	mu          sync.RWMutex
+	tokens      map[string]struct{}
+	keys        map[string]struct{}
+	subscribers map[chan struct{}]struct{}
 }
 
 // NewRevocationList creates an empty thread-safe revocation list.
 func NewRevocationList() *RevocationList {
 	return &RevocationList{
-		tokens: make(map[string]struct{}),
-		keys:   make(map[string]struct{}),
+		tokens:      make(map[string]struct{}),
+		keys:        make(map[string]struct{}),
+		subscribers: make(map[chan struct{}]struct{}),
+	}
+}
+
+func (r *RevocationList) notifySubscribersLocked() {
+	for ch := range r.subscribers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -39,6 +50,7 @@ func (r *RevocationList) ApplyRevocation(rev *controlplanev1.Revocation) {
 			r.keys[k] = struct{}{}
 		}
 	}
+	r.notifySubscribersLocked()
 }
 
 // RevokeToken registers an individual token identifier (e.g. jti, hash) as revoked.
@@ -48,6 +60,7 @@ func (r *RevocationList) RevokeToken(tokenID string) {
 	}
 	r.mu.Lock()
 	r.tokens[tokenID] = struct{}{}
+	r.notifySubscribersLocked()
 	r.mu.Unlock()
 }
 
@@ -58,6 +71,7 @@ func (r *RevocationList) RevokeKey(keyID string) {
 	}
 	r.mu.Lock()
 	r.keys[keyID] = struct{}{}
+	r.notifySubscribersLocked()
 	r.mu.Unlock()
 }
 
@@ -103,3 +117,23 @@ func (r *RevocationList) Count() (tokens int, keys int) {
 	defer r.mu.RUnlock()
 	return len(r.tokens), len(r.keys)
 }
+
+// Subscribe registers a listener channel notified on any revocation update.
+// Returns the event channel and an unsubscribe cleanup function.
+func (r *RevocationList) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	r.mu.Lock()
+	if r.subscribers == nil {
+		r.subscribers = make(map[chan struct{}]struct{})
+	}
+	r.subscribers[ch] = struct{}{}
+	r.mu.Unlock()
+
+	unsubscribe := func() {
+		r.mu.Lock()
+		delete(r.subscribers, ch)
+		r.mu.Unlock()
+	}
+	return ch, unsubscribe
+}
+
