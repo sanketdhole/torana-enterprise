@@ -15,7 +15,10 @@ import (
 	"github.com/phaselume/torana/internal/ingress"
 	"github.com/phaselume/torana/internal/pipeline"
 	"github.com/phaselume/torana/internal/router"
+	"github.com/phaselume/torana/internal/security/authn"
 	"github.com/phaselume/torana/internal/telemetry"
+
+	controlplanev1 "github.com/phaselume/torana/api/proto/controlplane/v1"
 )
 
 // Supervisor orchestrates all background tasks, listeners, and graceful shutdown.
@@ -27,6 +30,7 @@ type Supervisor struct {
 	emitter   *telemetry.Emitter
 	httpLsnr  *ingress.HTTPListener
 	cpClient  *controlplane.Client
+	revList   *authn.RevocationList
 	wg        sync.WaitGroup
 }
 
@@ -41,6 +45,9 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 	// Egress registry
 	egressReg := egress.NewRegistry()
 
+	// Revocation list
+	revList := authn.NewRevocationList()
+
 	// Pipeline filter chain
 	chain := pipeline.NewChain()
 	chain.SetLogger(logger)
@@ -54,6 +61,7 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 		egressReg: egressReg,
 		emitter:   emitter,
 		httpLsnr:  httpLsnr,
+		revList:   revList,
 	}
 
 	// 1. Check if a static bootstrap bundle file is provided
@@ -126,6 +134,23 @@ func (s *Supervisor) UpdateSnapshot(snap *config.Snapshot) error {
 		"routes_count", len(snap.Routes),
 		"upstreams_count", len(snap.Upstreams),
 	)
+	return nil
+}
+
+// RevocationList returns the supervisor's active RevocationList.
+func (s *Supervisor) RevocationList() *authn.RevocationList {
+	return s.revList
+}
+
+// ApplyRevocation applies dynamic revocation instructions from the control plane.
+func (s *Supervisor) ApplyRevocation(rev *controlplanev1.Revocation) error {
+	if s.revList != nil && rev != nil {
+		s.revList.ApplyRevocation(rev)
+		s.logger.Info("applied revocation update from control plane",
+			"revoked_tokens", len(rev.RevokedTokens),
+			"revoked_keys", len(rev.RevokedKeys),
+		)
+	}
 	return nil
 }
 

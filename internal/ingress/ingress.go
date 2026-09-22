@@ -192,9 +192,19 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	env.PeerInfo = pipeline.PeerInfo{
 		RemoteIP: r.RemoteAddr,
 		Protocol: r.Proto,
+		TLS:      r.TLS,
 	}
 
-	// 5. Run Phase 1: Request Headers
+	// 5. Run Phase 0: Authn
+	if l.chain != nil {
+		decision, err := l.chain.ExecutePhase(r.Context(), env, pipeline.PhaseAuthn, 0)
+		if err != nil || decision.Action == pipeline.ActionHalt || decision.Action == pipeline.ActionDrop {
+			l.handleHalt(w, env, decision, startTime, err)
+			return
+		}
+	}
+
+	// 6. Run Phase 1: Request Headers
 	if l.chain != nil {
 		decision, err := l.chain.ExecutePhase(r.Context(), env, pipeline.PhaseRequestHeaders, 0)
 		if err != nil || decision.Action == pipeline.ActionHalt || decision.Action == pipeline.ActionDrop {

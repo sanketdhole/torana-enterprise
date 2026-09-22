@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -35,10 +36,13 @@ const (
 	PhaseRequestBody
 	PhaseResponseHeaders
 	PhaseResponseBody
+	PhaseAuthn
 )
 
 func (p Phase) String() string {
 	switch p {
+	case PhaseAuthn:
+		return "authn"
 	case PhaseRequestHeaders:
 		return "request_headers"
 	case PhaseRequestBody:
@@ -119,6 +123,7 @@ type PeerInfo struct {
 	RemoteIP       string
 	Protocol       string
 	ClientIdentity string
+	TLS            *tls.ConnectionState
 }
 
 // Decision represents the output returned by a filter process step.
@@ -159,6 +164,7 @@ type Envelope struct {
 	Headers      http.Header
 	Metadata     map[string]string
 	Claims       map[string]string
+	Identity     any
 	Body         io.Reader
 	BufferedBody []byte
 	PeerInfo     PeerInfo
@@ -178,6 +184,7 @@ func (e *Envelope) Reset() {
 	e.PeerInfo = PeerInfo{}
 	e.StartTime = time.Time{}
 	e.Headers = nil
+	e.Identity = nil
 
 	clear(e.Metadata)
 	clear(e.Claims)

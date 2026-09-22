@@ -29,6 +29,11 @@ type SnapshotConsumer interface {
 	UpdateSnapshot(snap *config.Snapshot) error
 }
 
+// RevocationConsumer is an optional interface to receive dynamic revocation updates.
+type RevocationConsumer interface {
+	ApplyRevocation(rev *controlplanev1.Revocation) error
+}
+
 // Client manages the control plane gRPC stream lifecycle.
 type Client struct {
 	cfg       *config.BootstrapConfig
@@ -292,6 +297,16 @@ func (c *Client) handleControlMessage(stream controlplanev1.ControlPlaneService_
 				},
 			},
 		})
+
+	case *controlplanev1.ControlMessage_Revocation:
+		rev := p.Revocation
+		c.logger.Info("received revocation update from control plane",
+			"revoked_tokens", len(rev.RevokedTokens),
+			"revoked_keys", len(rev.RevokedKeys),
+		)
+		if rc, ok := c.consumer.(RevocationConsumer); ok {
+			_ = rc.ApplyRevocation(rev)
+		}
 	}
 }
 
