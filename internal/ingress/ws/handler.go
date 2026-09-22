@@ -91,25 +91,35 @@ func NewHandler(
 	}
 }
 
+// SetHTTPClient overrides the HTTP client used for upstream websocket dials and HTTP backends.
+func (h *Handler) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		h.httpClient = client
+	}
+}
+
 // isRevoked inspects the envelope for revoked credentials (token, key, or subject).
 func (h *Handler) isRevoked(env *pipeline.Envelope) bool {
 	if h.revList == nil || env == nil {
 		return false
 	}
 
-	// 1. Check Authorization token or bearer
-	if authHdr := env.Headers.Get("Authorization"); authHdr != "" {
-		tok := strings.TrimPrefix(authHdr, "Bearer ")
-		tok = strings.TrimSpace(tok)
-		if h.revList.IsTokenRevoked(tok) || h.revList.IsRevoked(tok) {
-			return true
+	for k, vv := range env.Headers {
+		if len(vv) == 0 {
+			continue
 		}
-	}
-
-	// 2. Check X-API-Key
-	if apiKey := env.Headers.Get("X-API-Key"); apiKey != "" {
-		if h.revList.IsKeyRevoked(apiKey) || h.revList.IsRevoked(apiKey) {
-			return true
+		val := vv[0]
+		if strings.EqualFold(k, "Authorization") {
+			tok := strings.TrimPrefix(val, "Bearer ")
+			tok = strings.TrimSpace(tok)
+			if h.revList.IsTokenRevoked(tok) || h.revList.IsRevoked(tok) {
+				return true
+			}
+		} else if strings.EqualFold(k, "X-API-Key") {
+			key := strings.TrimSpace(val)
+			if h.revList.IsKeyRevoked(key) || h.revList.IsRevoked(key) {
+				return true
+			}
 		}
 	}
 
@@ -151,6 +161,16 @@ func (h *Handler) applyChunkHooks(ctx context.Context, env *pipeline.Envelope, c
 		}
 	}
 	return current, nil
+}
+
+// IsRevoked inspects the envelope for revoked credentials (token, key, or subject).
+func (h *Handler) IsRevoked(env *pipeline.Envelope) bool {
+	return h.isRevoked(env)
+}
+
+// ApplyChunkHooks runs all registered ChunkHook filters over a raw frame payload.
+func (h *Handler) ApplyChunkHooks(ctx context.Context, env *pipeline.Envelope, chunk []byte) ([]byte, error) {
+	return h.applyChunkHooks(ctx, env, chunk)
 }
 
 // Handle upgrades the HTTP connection to WebSocket and initiates proxying.
@@ -304,9 +324,11 @@ func (h *Handler) proxyToUpstreamWS(
 		}
 	}
 
-	upstream, _, err := websocket.Dial(ctx, upstreamURL, &websocket.DialOptions{
+	dialOpts := &websocket.DialOptions{
 		HTTPHeader: dialHeaders,
-	})
+		HTTPClient: h.httpClient,
+	}
+	upstream, _, err := websocket.Dial(ctx, upstreamURL, dialOpts)
 	if err != nil {
 		if h.logger != nil {
 			h.logger.Error("failed to dial upstream websocket", "url", upstreamURL, "error", err)

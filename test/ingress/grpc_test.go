@@ -26,7 +26,7 @@ import (
 func setupGRPCTestEnvironment(t *testing.T, chain *pipeline.Chain) (*grpc.ClientConn, func()) {
 	// 1. Upstream gRPC Server
 	upstreamLis := bufconn.Listen(1024 * 1024)
-	upstreamServer := grpc.NewServer()
+	upstreamServer := grpc.NewServer(grpc.ForceServerCodec(egressgrpc.RawCodec{}))
 
 	upstreamServer.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.TestService",
@@ -210,6 +210,7 @@ func TestGRPCProxy_UnaryWithMetadataAndTrailers(t *testing.T) {
 	err := conn.Invoke(ctx, "/test.TestService/Unary", &in, &out,
 		grpc.Header(&headerMD),
 		grpc.Trailer(&trailerMD),
+		grpc.ForceCodec(egressgrpc.RawCodec{}),
 	)
 	if err != nil {
 		t.Fatalf("unary invoke failed: %v", err)
@@ -237,7 +238,7 @@ func TestGRPCProxy_ServerStreaming(t *testing.T) {
 		StreamName:    "ServerStream",
 		ServerStreams: true,
 	}
-	stream, err := conn.NewStream(context.Background(), desc, "/test.TestService/ServerStream")
+	stream, err := conn.NewStream(context.Background(), desc, "/test.TestService/ServerStream", grpc.ForceCodec(egressgrpc.RawCodec{}))
 	if err != nil {
 		t.Fatalf("failed to create server stream: %v", err)
 	}
@@ -277,7 +278,7 @@ func TestGRPCProxy_ClientStreaming(t *testing.T) {
 		StreamName:    "ClientStream",
 		ClientStreams: true,
 	}
-	stream, err := conn.NewStream(context.Background(), desc, "/test.TestService/ClientStream")
+	stream, err := conn.NewStream(context.Background(), desc, "/test.TestService/ClientStream", grpc.ForceCodec(egressgrpc.RawCodec{}))
 	if err != nil {
 		t.Fatalf("failed to create client stream: %v", err)
 	}
@@ -311,7 +312,7 @@ func TestGRPCProxy_BidirectionalStreaming(t *testing.T) {
 		ServerStreams: true,
 		ClientStreams: true,
 	}
-	stream, err := conn.NewStream(context.Background(), desc, "/test.TestService/BidiStream")
+	stream, err := conn.NewStream(context.Background(), desc, "/test.TestService/BidiStream", grpc.ForceCodec(egressgrpc.RawCodec{}))
 	if err != nil {
 		t.Fatalf("failed to create bidi stream: %v", err)
 	}
@@ -345,7 +346,7 @@ func TestGRPCProxy_UpstreamStatusPassThrough(t *testing.T) {
 	in.Payload = []byte("fail")
 	var out egressgrpc.Frame
 
-	err := conn.Invoke(ctx, "/test.TestService/Unary", &in, &out)
+	err := conn.Invoke(ctx, "/test.TestService/Unary", &in, &out, grpc.ForceCodec(egressgrpc.RawCodec{}))
 	if err == nil {
 		t.Fatalf("expected error from upstream, got nil")
 	}
@@ -390,7 +391,7 @@ func TestGRPCProxy_PipelineFilterHaltMapping(t *testing.T) {
 		defer cleanup()
 
 		var in, out egressgrpc.Frame
-		err := conn.Invoke(context.Background(), "/test.TestService/Unary", &in, &out)
+		err := conn.Invoke(context.Background(), "/test.TestService/Unary", &in, &out, grpc.ForceCodec(egressgrpc.RawCodec{}))
 		st, ok := status.FromError(err)
 		if !ok || st.Code() != codes.Unauthenticated {
 			t.Errorf("expected codes.Unauthenticated, got %v (%v)", st.Code(), err)
@@ -406,7 +407,7 @@ func TestGRPCProxy_PipelineFilterHaltMapping(t *testing.T) {
 		defer cleanup()
 
 		var in, out egressgrpc.Frame
-		err := conn.Invoke(context.Background(), "/test.TestService/Unary", &in, &out)
+		err := conn.Invoke(context.Background(), "/test.TestService/Unary", &in, &out, grpc.ForceCodec(egressgrpc.RawCodec{}))
 		st, ok := status.FromError(err)
 		if !ok || st.Code() != codes.PermissionDenied {
 			t.Errorf("expected codes.PermissionDenied, got %v (%v)", st.Code(), err)
@@ -426,7 +427,7 @@ func TestGRPCProxy_PipelineFilterHaltMapping(t *testing.T) {
 
 		var in, out egressgrpc.Frame
 		var trailerMD metadata.MD
-		err := conn.Invoke(context.Background(), "/test.TestService/Unary", &in, &out, grpc.Trailer(&trailerMD))
+		err := conn.Invoke(context.Background(), "/test.TestService/Unary", &in, &out, grpc.Trailer(&trailerMD), grpc.ForceCodec(egressgrpc.RawCodec{}))
 		st, ok := status.FromError(err)
 		if !ok || st.Code() != codes.ResourceExhausted {
 			t.Errorf("expected codes.ResourceExhausted, got %v (%v)", st.Code(), err)
@@ -435,4 +436,21 @@ func TestGRPCProxy_PipelineFilterHaltMapping(t *testing.T) {
 			t.Errorf("expected trailer retry-after=30, got %v", trailerMD)
 		}
 	})
+}
+
+func BenchmarkGRPCProxy_Unary(b *testing.B) {
+	chain := pipeline.NewChain()
+	conn, cleanup := setupGRPCTestEnvironment(&testing.T{}, chain)
+	defer cleanup()
+
+	ctx := context.Background()
+	var in egressgrpc.Frame
+	in.Payload = []byte("benchmark-payload-bytes")
+	var out egressgrpc.Frame
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = conn.Invoke(ctx, "/test.TestService/Unary", &in, &out, grpc.ForceCodec(egressgrpc.RawCodec{}))
+	}
 }
