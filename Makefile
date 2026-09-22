@@ -1,4 +1,4 @@
-.PHONY: all build test bench lint vet proto clean docker-build
+.PHONY: all build test bench lint vet proto clean docker-build mockplatform
 
 VERSION ?= 0.1.0-dev
 BIN_DIR = bin
@@ -11,6 +11,9 @@ all: vet test build
 build:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.Version=$(VERSION)" -o $(BINARY) ./cmd/gateway-data
+
+mockplatform:
+	$(GO) run ./test/mockplatform
 
 test:
 	$(GO) test -v -race ./...

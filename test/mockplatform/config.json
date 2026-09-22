@@ -1,0 +1,60 @@
+{
+  "routes": [
+    {
+      "id": "route-openai-chat",
+      "path": "/v1/chat/completions",
+      "method": "POST",
+      "upstream_id": "upstream-openai",
+      "timeout_ms": 30000
+    },
+    {
+      "id": "route-openai-models",
+      "path": "/v1/models",
+      "method": "GET",
+      "upstream_id": "upstream-openai",
+      "timeout_ms": 5000
+    },
+    {
+      "id": "route-anthropic-messages",
+      "path": "/v1/messages",
+      "method": "POST",
+      "upstream_id": "upstream-anthropic",
+      "timeout_ms": 30000
+    },
+    {
+      "id": "route-order-service",
+      "path": "v1/orders",
+      "method": "GET",
+      "upstream_id": "upstream-order",
+      "timeout_ms": 50000
+    }
+  ],
+  "upstreams": [
+    {
+      "id": "upstream-openai",
+      "protocol": "http",
+      "endpoints": [
+        "https://api.openai.com"
+      ],
+      "timeout_ms": 30000,
+      "max_conns": 100
+    },
+    {
+      "id": "upstream-anthropic",
+      "protocol": "http",
+      "endpoints": [
+        "https://api.anthropic.com"
+      ],
+      "timeout_ms": 30000,
+      "max_conns": 100
+    }
+  ],
+  "policies": [
+    {
+      "id": "policy-auth",
+      "name": "RequireAPIKey",
+      "type": "authn",
+      "action": "ALLOW"
+    }
+  ]
+}

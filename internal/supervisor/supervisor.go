@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/phaselume/torana/internal/config"
+	"github.com/phaselume/torana/internal/controlplane"
 	"github.com/phaselume/torana/internal/egress"
 	"github.com/phaselume/torana/internal/ingress"
 	"github.com/phaselume/torana/internal/pipeline"
@@ -25,6 +26,7 @@ type Supervisor struct {
 	egressReg *egress.Registry
 	emitter   *telemetry.Emitter
 	httpLsnr  *ingress.HTTPListener
+	cpClient  *controlplane.Client
 	wg        sync.WaitGroup
 }
 
@@ -44,6 +46,15 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 
 	httpLsnr := ingress.NewHTTPListener(cfg, holder, egressReg, emitter, chain, logger)
 
+	sup := &Supervisor{
+		cfg:       cfg,
+		logger:    logger,
+		holder:    holder,
+		egressReg: egressReg,
+		emitter:   emitter,
+		httpLsnr:  httpLsnr,
+	}
+
 	// Check if a static bootstrap bundle file is provided
 	if cfg.ConfigBundle != "" {
 		snap, err := config.LoadBundleFromFile(cfg.ConfigBundle)
@@ -61,14 +72,12 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 		httpLsnr.SetReady(false)
 	}
 
-	return &Supervisor{
-		cfg:       cfg,
-		logger:    logger,
-		holder:    holder,
-		egressReg: egressReg,
-		emitter:   emitter,
-		httpLsnr:  httpLsnr,
+	// If PlatformURL is configured, initialize control plane client
+	if cfg.PlatformURL != "" {
+		sup.cpClient = controlplane.NewClient(cfg, sup, logger)
 	}
+
+	return sup
 }
 
 // UpdateSnapshot applies a new configuration snapshot atomically across the data plane.
@@ -97,6 +106,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	// Start telemetry emitter background worker
 	s.emitter.Start(ctx)
 
+	// Start control plane client worker if configured
+	if s.cpClient != nil {
+		s.cpClient.Start(ctx)
+	}
+
 	// Listen for OS signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -116,6 +130,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		"namespace", s.cfg.Namespace,
 		"http_addr", s.cfg.HTTPAddress(),
 		"grpc_addr", s.cfg.GRPCAddress(),
+		"platform_url", s.cfg.PlatformURL,
 		"env", s.cfg.Environment,
 		"ready", s.holder.HasSnapshot(),
 	)
@@ -142,10 +157,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	// 2. Wait for ingress goroutine
 	s.wg.Wait()
 
-	// 3. Drain and stop telemetry emitter
+	// 3. Stop control plane client
+	if s.cpClient != nil {
+		s.cpClient.Stop()
+	}
+
+	// 4. Drain and stop telemetry emitter
 	s.emitter.Stop(s.cfg.DrainTimeout)
 
-	// 4. Close egress connection pools
+	// 5. Close egress connection pools
 	_ = s.egressReg.Close()
 
 	s.logger.Info("torana data plane shutdown completed gracefully")
