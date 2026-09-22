@@ -45,8 +45,7 @@ func (t *testSink) SendBatch(_ context.Context, events []telemetry.Event) error 
 
 func setupTestListener() (*HTTPListener, *testSink) {
 	cfg := &config.BootstrapConfig{
-		HTTPPort: "8080",
-		HTTPHost: "127.0.0.1",
+		ListenHTTP: ":8080",
 	}
 
 	snap := &config.Snapshot{

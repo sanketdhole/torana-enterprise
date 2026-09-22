@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -75,6 +77,37 @@ func TestSnapshotHolder_StoreAndLoad(t *testing.T) {
 				t.Errorf("expected version %d, got %d", tt.wantVersion, snap.Version)
 			}
 		})
+	}
+}
+
+func TestLoadBundleFromFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundleFile := filepath.Join(tmpDir, "bundle.json")
+
+	validJSON := `{
+		"version": 42,
+		"signature": "test-signature",
+		"routes": [
+			{"id": "r1", "path": "/v1/chat/completions", "method": "POST", "upstream_id": "u1"}
+		],
+		"upstreams": {
+			"u1": {"id": "u1", "protocol": "http", "endpoints": ["http://localhost:8000"]}
+		}
+	}`
+
+	if err := os.WriteFile(bundleFile, []byte(validJSON), 0600); err != nil {
+		t.Fatalf("failed to write test bundle: %v", err)
+	}
+
+	snap, err := LoadBundleFromFile(bundleFile)
+	if err != nil {
+		t.Fatalf("failed to load bundle: %v", err)
+	}
+	if snap.Version != 42 {
+		t.Errorf("expected version 42, got %d", snap.Version)
+	}
+	if len(snap.Routes) != 1 {
+		t.Errorf("expected 1 route, got %d", len(snap.Routes))
 	}
 }
 

@@ -1,0 +1,230 @@
+syntax = "proto3";
+
+package controlplane.v1;
+
+option go_package = "github.com/phaselume/torana/api/proto/controlplane/v1;controlplanev1";
+
+import "google/protobuf/timestamp.proto";
+
+// ControlPlaneService coordinates registration, health reporting, and dynamic configuration streaming.
+service ControlPlaneService {
+  // Enroll registers a new gateway node instance with the control plane platform.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Stream establishes a bidirectional control stream between gateway node and platform service.
+  rpc Stream(stream NodeMessage) returns (stream ControlMessage);
+}
+
+// EnrollRequest is sent upon gateway startup to authenticate and obtain initial cluster identity.
+message EnrollRequest {
+  string namespace = 1;
+  string node_id = 2;
+  string enroll_token = 3;
+  string version = 4;
+  map<string, string> labels = 5;
+}
+
+// EnrollResponse returns enrollment status and initial credentials.
+message EnrollResponse {
+  bool accepted = 1;
+  string cluster_id = 2;
+  string error_message = 3;
+  google.protobuf.Timestamp enrolled_at = 4;
+}
+
+// NodeMessage is streamed from gateway-data to the platform control plane.
+message NodeMessage {
+  string node_id = 1;
+  string namespace = 2;
+  google.protobuf.Timestamp timestamp = 3;
+
+  oneof payload {
+    Hello hello = 4;
+    Ack ack = 5;
+    Nack nack = 6;
+    Heartbeat heartbeat = 7;
+    PluginStatus plugin_status = 8;
+    UsageReport usage_report = 9;
+  }
+}
+
+// Hello is sent upon stream establishment to declare node capabilities.
+message Hello {
+  string version = 1;
+  repeated string supported_protocols = 2;
+  repeated string supported_plugins = 3;
+  google.protobuf.Timestamp start_time = 4;
+}
+
+// Ack confirms successful atomic application of a configuration snapshot or delta.
+message Ack {
+  uint64 applied_config_version = 1;
+  string signature = 2;
+}
+
+// Nack informs the platform that a configuration update was rejected (e.g. invalid signature, compile error).
+message Nack {
+  uint64 rejected_config_version = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+// Heartbeat reports active load and runtime health metrics.
+message Heartbeat {
+  int64 active_connections = 1;
+  int64 active_streams = 2;
+  int64 memory_allocated_bytes = 3;
+  int64 cpu_usage_permille = 4;
+  uint64 current_config_version = 5;
+}
+
+// PluginStatus reports the operational status of an attached plugin.
+message PluginStatus {
+  string plugin_id = 1;
+  string status = 2; // e.g. "HEALTHY", "DEGRADED", "FAILED"
+  string error_message = 3;
+  int64 latency_ms = 4;
+}
+
+// UsageReport batches non-sensitive telemetry token usage for billing and quotas.
+// CUSTOMER PAYLOADS ARE STRICTLY EXCLUDED.
+message UsageReport {
+  repeated TenantUsage tenant_reports = 1;
+}
+
+message TenantUsage {
+  string tenant_id = 1;
+  string route_id = 2;
+  string model = 3;
+  int64 prompt_tokens = 4;
+  int64 completion_tokens = 5;
+  int64 total_requests = 6;
+  int64 duration_ms_sum = 7;
+}
+
+// ControlMessage is streamed from platform control plane to gateway-data.
+message ControlMessage {
+  string message_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+
+  oneof payload {
+    Snapshot snapshot = 3;
+    Delta delta = 4;
+    PluginAssignment plugin_assignment = 5;
+    Revocation revocation = 6;
+    Command command = 7;
+  }
+}
+
+// Snapshot contains a complete, self-contained configuration snapshot.
+message Snapshot {
+  uint64 config_version = 1;
+  bytes ed25519_signature = 2;
+  google.protobuf.Timestamp created_at = 3;
+  
+  repeated Route routes = 4;
+  repeated Policy policies = 5;
+  repeated AuthnProvider authn_providers = 6;
+  repeated TokenBudget token_budgets = 7;
+  repeated PluginAssignment plugin_assignments = 8;
+  repeated Upstream upstreams = 9;
+}
+
+// Delta contains incremental configuration changes applied on top of a known base version.
+message Delta {
+  uint64 base_config_version = 1;
+  uint64 target_config_version = 2;
+  bytes ed25519_signature = 3;
+  
+  repeated Route added_or_updated_routes = 4;
+  repeated string deleted_route_ids = 5;
+  repeated Policy added_or_updated_policies = 6;
+  repeated string deleted_policy_ids = 7;
+  repeated Upstream added_or_updated_upstreams = 8;
+  repeated string deleted_upstream_ids = 9;
+}
+
+// Route defines matching rules and upstream targets.
+message Route {
+  string id = 1;
+  string path = 2;
+  bool path_prefix = 3;
+  string method = 4;
+  map<string, string> headers = 5;
+  string upstream_id = 6;
+  repeated string policy_ids = 7;
+  int64 timeout_ms = 8;
+}
+
+// Policy defines a pre-compiled CEL policy or built-in filter rule.
+message Policy {
+  string id = 1;
+  string name = 2;
+  string type = 3; // "authn", "authz", "ratelimit", "cel", "schema"
+  string cel_expression = 4; // Pre-compiled CEL expression string
+  string action = 5; // "ALLOW", "DENY", "MUTATE", "AUDIT"
+  map<string, string> parameters = 6;
+}
+
+// AuthnProvider configures authentication providers.
+message AuthnProvider {
+  string id = 1;
+  string type = 2; // "JWT", "API_KEY", "OIDC", "MTLS"
+  string issuer = 3;
+  string jwks_url = 4;
+  SecretRef secret_ref = 5;
+}
+
+// TokenBudget configures quota enforcement per tenant/model.
+message TokenBudget {
+  string tenant_id = 1;
+  string model_id = 2;
+  int64 max_prompt_tokens_per_min = 3;
+  int64 max_completion_tokens_per_min = 4;
+  double max_cost_per_day = 5;
+}
+
+// PluginAssignment configures dynamic plugin attachment.
+message PluginAssignment {
+  string plugin_id = 1;
+  string endpoint = 2; // gRPC or UDS endpoint
+  string phase = 3; // "REQUEST_HEADERS", "REQUEST_BODY", "RESPONSE_HEADERS", "RESPONSE_BODY"
+  string body_mode = 4; // "NONE", "STREAMING", "BUFFERED"
+  int64 timeout_ms = 5;
+  string config_json = 6;
+}
+
+// Upstream defines destination clusters.
+message Upstream {
+  string id = 1;
+  string protocol = 2; // "http", "grpc", "postgres", "llm", "mcp"
+  repeated string endpoints = 3;
+  int64 timeout_ms = 4;
+  int32 max_conns = 5;
+  repeated SecretRef secret_refs = 6;
+}
+
+// SecretRef represents an indirect reference to a secret stored in local secret providers.
+message SecretRef {
+  string name = 1;
+  string provider = 2; // "env", "k8s", "vault"
+  string key = 3;
+}
+
+// Revocation notifies nodes of revoked credentials or API keys.
+message Revocation {
+  repeated string revoked_tokens = 1;
+  repeated string revoked_keys = 2;
+}
+
+// Command instructs the node to execute operational commands.
+message Command {
+  enum CommandType {
+    UNKNOWN = 0;
+    DRAIN = 1;
+    RELOAD = 2;
+    PROBE = 3;
+  }
+  CommandType command_type = 1;
+  int64 timeout_ms = 2;
+}

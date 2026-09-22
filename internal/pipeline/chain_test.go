@@ -1,192 +1,111 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"net/http"
-	"strings"
 	"testing"
 )
 
-type mockHeaderFilter struct {
-	headerKey string
-	headerVal string
-}
-
-func (m *mockHeaderFilter) Name() string           { return "mock_header" }
-func (m *mockHeaderFilter) BodyMode() BodyMode     { return BodyModeNone }
-func (m *mockHeaderFilter) Execute(ctx *RequestContext) error {
-	ctx.Headers.Set(m.headerKey, m.headerVal)
-	ctx.SetMetadata("header_added", m.headerKey)
-	return nil
-}
-
 type mockAuthFilter struct {
-	allowToken string
+	token string
 }
 
-func (m *mockAuthFilter) Name() string       { return "mock_auth" }
+func (m *mockAuthFilter) Name() string     { return "mock_auth" }
+func (m *mockAuthFilter) Phase() Phase     { return PhaseRequestHeaders }
 func (m *mockAuthFilter) BodyMode() BodyMode { return BodyModeNone }
-func (m *mockAuthFilter) Execute(ctx *RequestContext) error {
-	authHeader := ctx.Headers.Get("Authorization")
-	if authHeader == "" || authHeader != "Bearer "+m.allowToken {
-		return ErrUnauthorized
+func (m *mockAuthFilter) Process(_ context.Context, env *Envelope) (Decision, error) {
+	if env.Headers.Get("Authorization") != "Bearer "+m.token {
+		return HaltDecision(http.StatusUnauthorized, "invalid token"), nil
 	}
-	ctx.SetMetadata("user_id", "user_123")
-	return nil
+	env.SetMetadata("user_id", "u_456")
+	return ContinueDecision(), nil
 }
+func (m *mockAuthFilter) Close() error { return nil }
 
-type mockBufferedFilter struct {
-	maxBytes int64
-}
+type mockMutateFilter struct{}
 
-func (m *mockBufferedFilter) Name() string       { return "mock_buffered" }
-func (m *mockBufferedFilter) BodyMode() BodyMode { return BodyModeBuffered }
-func (m *mockBufferedFilter) Execute(ctx *RequestContext) error {
-	body, err := ctx.GetBufferedBody(m.maxBytes)
-	if err != nil {
-		return err
-	}
-	ctx.SetMetadata("body_len", string(rune(len(body))))
-	return nil
+func (m *mockMutateFilter) Name() string     { return "mock_mutate" }
+func (m *mockMutateFilter) Phase() Phase     { return PhaseRequestHeaders }
+func (m *mockMutateFilter) BodyMode() BodyMode { return BodyModeNone }
+func (m *mockMutateFilter) Process(_ context.Context, _ *Envelope) (Decision, error) {
+	return Decision{
+		Action: ActionMutate,
+		MutateHeaders: map[string]string{
+			"X-Injected-Header": "Gateway-Torana",
+		},
+		MutateMetadata: map[string]string{
+			"injected": "true",
+		},
+	}, nil
 }
+func (m *mockMutateFilter) Close() error { return nil }
 
 func TestChain_Execute(t *testing.T) {
-	tests := []struct {
-		name          string
-		filters       []Filter
-		authHeader    string
-		bodyContent   string
-		expectError   bool
-		expectedErrIs error
-		checkMetaKey  string
-		checkMetaVal  string
-	}{
-		{
-			name: "successful header mutation and metadata",
-			filters: []Filter{
-				&mockHeaderFilter{headerKey: "X-Torana-Gateway", headerVal: "v1"},
-			},
-			expectError:  false,
-			checkMetaKey: "header_added",
-			checkMetaVal: "X-Torana-Gateway",
-		},
-		{
-			name: "auth success",
-			filters: []Filter{
-				&mockAuthFilter{allowToken: "secret123"},
-			},
-			authHeader:   "Bearer secret123",
-			expectError:  false,
-			checkMetaKey: "user_id",
-			checkMetaVal: "user_123",
-		},
-		{
-			name: "auth fail closed on missing token",
-			filters: []Filter{
-				&mockAuthFilter{allowToken: "secret123"},
-				&mockHeaderFilter{headerKey: "X-Unreachable", headerVal: "true"},
-			},
-			authHeader:    "",
-			expectError:   true,
-			expectedErrIs: ErrUnauthorized,
-		},
-		{
-			name: "buffered body success",
-			filters: []Filter{
-				&mockBufferedFilter{maxBytes: 1024},
-			},
-			bodyContent: "hello world payload",
-			expectError: false,
-		},
-		{
-			name: "buffered body exceeds max limit",
-			filters: []Filter{
-				&mockBufferedFilter{maxBytes: 5},
-			},
-			bodyContent:   "this is longer than 5 bytes",
-			expectError:   true,
-			expectedErrIs: ErrBodyTooLarge,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			headers := make(http.Header)
-			if tt.authHeader != "" {
-				headers.Set("Authorization", tt.authHeader)
-			}
-
-			var bodyReader *strings.Reader
-			if tt.bodyContent != "" {
-				bodyReader = strings.NewReader(tt.bodyContent)
-			}
-
-			reqCtx := NewRequestContext(context.Background(), "POST", "/v1/chat", headers, bodyReader)
-			chain := NewChain(tt.filters...)
-
-			err := chain.Execute(reqCtx)
-
-			if tt.expectError {
-				if err == nil {
-					t.Fatalf("expected error, got nil")
-				}
-				if tt.expectedErrIs != nil && !errors.Is(err, tt.expectedErrIs) {
-					t.Fatalf("expected error %v, got %v", tt.expectedErrIs, err)
-				}
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if tt.checkMetaKey != "" {
-				val, ok := reqCtx.GetMetadata(tt.checkMetaKey)
-				if !ok || val != tt.checkMetaVal {
-					t.Errorf("expected metadata[%s]=%s, got %s (exists=%v)", tt.checkMetaKey, tt.checkMetaVal, val, ok)
-				}
-			}
-		})
-	}
-}
-
-func BenchmarkChain_ExecuteHeaderOnly(b *testing.B) {
 	chain := NewChain(
-		&mockHeaderFilter{headerKey: "X-Gateway-ID", headerVal: "torana-data-1"},
-		&mockAuthFilter{allowToken: "valid_token"},
+		&mockAuthFilter{token: "valid-secret"},
+		&mockMutateFilter{},
 	)
 
-	b.ResetTimer()
-	b.ReportAllocs()
+	t.Run("auth failure halts chain", func(t *testing.T) {
+		headers := make(http.Header)
+		headers.Set("Authorization", "Bearer wrong-token")
+		env := NewEnvelope("req-1", PhaseRequestHeaders, "POST", "/v1/chat", headers, nil)
 
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			headers := make(http.Header)
-			headers.Set("Authorization", "Bearer valid_token")
-			reqCtx := NewRequestContext(context.Background(), "POST", "/v1/chat", headers, nil)
-			if err := chain.Execute(reqCtx); err != nil {
-				b.Fatal(err)
-			}
+		decision, err := chain.Execute(context.Background(), env)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if decision.Action != ActionHalt {
+			t.Errorf("expected ActionHalt, got %v", decision.Action)
+		}
+		if decision.StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected status 401, got %d", decision.StatusCode)
+		}
+		if env.Headers.Get("X-Injected-Header") != "" {
+			t.Errorf("expected mutated header not to be present on halted chain")
+		}
+	})
+
+	t.Run("auth success applies mutations", func(t *testing.T) {
+		headers := make(http.Header)
+		headers.Set("Authorization", "Bearer valid-secret")
+		env := NewEnvelope("req-2", PhaseRequestHeaders, "POST", "/v1/chat", headers, nil)
+
+		decision, err := chain.Execute(context.Background(), env)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if decision.Action != ActionContinue {
+			t.Errorf("expected ActionContinue, got %v", decision.Action)
+		}
+		if env.Headers.Get("X-Injected-Header") != "Gateway-Torana" {
+			t.Errorf("expected header 'Gateway-Torana', got %s", env.Headers.Get("X-Injected-Header"))
+		}
+		if val, ok := env.GetMetadata("user_id"); !ok || val != "u_456" {
+			t.Errorf("expected metadata user_id=u_456, got %s", val)
+		}
+		if val, ok := env.GetMetadata("injected"); !ok || val != "true" {
+			t.Errorf("expected metadata injected=true, got %s", val)
 		}
 	})
 }
 
-func BenchmarkChain_StreamingPassThrough(b *testing.B) {
+func BenchmarkChain_Execute(b *testing.B) {
 	chain := NewChain(
-		&mockHeaderFilter{headerKey: "X-Gateway-ID", headerVal: "torana-data-1"},
+		&mockAuthFilter{token: "valid-secret"},
+		&mockMutateFilter{},
 	)
-
-	payload := []byte("streaming-chunk-data")
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			reqCtx := NewRequestContext(context.Background(), "POST", "/v1/chat", nil, bytes.NewReader(payload))
-			if err := chain.Execute(reqCtx); err != nil {
+			headers := make(http.Header)
+			headers.Set("Authorization", "Bearer valid-secret")
+			env := NewEnvelope("req-bench", PhaseRequestHeaders, "POST", "/v1/chat", headers, nil)
+			_, err := chain.Execute(context.Background(), env)
+			if err != nil {
 				b.Fatal(err)
 			}
 		}

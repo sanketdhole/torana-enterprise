@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/phaselume/torana/internal/config"
 	"github.com/phaselume/torana/internal/egress"
@@ -33,15 +32,6 @@ type Supervisor struct {
 func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 	holder := config.NewSnapshotHolder()
 
-	// Initialize default snapshot for startup if needed
-	defaultSnap := &config.Snapshot{
-		Version:   1,
-		Timestamp: time.Now(),
-		Routes:    nil,
-		Upstreams: make(map[string]config.UpstreamCluster),
-	}
-	_ = holder.Store(defaultSnap)
-
 	// Logging telemetry sink
 	sink := telemetry.NewLoggingSink(logger)
 	emitter := telemetry.NewEmitter(cfg.TelemetryQueueSize, sink, logger)
@@ -49,12 +39,27 @@ func New(cfg *config.BootstrapConfig, logger *slog.Logger) *Supervisor {
 	// Egress registry
 	egressReg := egress.NewRegistry()
 
-	// Pipeline filter chain (standard auth/logging filters can be attached)
+	// Pipeline filter chain
 	chain := pipeline.NewChain()
 
 	httpLsnr := ingress.NewHTTPListener(cfg, holder, egressReg, emitter, chain, logger)
-	httpLsnr.UpdateRouter(router.Compile(defaultSnap))
-	httpLsnr.SetReady(true)
+
+	// Check if a static bootstrap bundle file is provided
+	if cfg.ConfigBundle != "" {
+		snap, err := config.LoadBundleFromFile(cfg.ConfigBundle)
+		if err != nil {
+			logger.Warn("failed to load initial config bundle, starting unready", "path", cfg.ConfigBundle, "error", err)
+			httpLsnr.SetReady(false)
+		} else {
+			_ = holder.Store(snap)
+			httpLsnr.UpdateRouter(router.Compile(snap))
+			httpLsnr.SetReady(true)
+			logger.Info("loaded bootstrap config bundle", "path", cfg.ConfigBundle, "version", snap.Version)
+		}
+	} else {
+		// Starts not ready until config snapshot arrives via control plane stream
+		httpLsnr.SetReady(false)
+	}
 
 	return &Supervisor{
 		cfg:       cfg,
@@ -74,6 +79,7 @@ func (s *Supervisor) UpdateSnapshot(snap *config.Snapshot) error {
 
 	compiledRouter := router.Compile(snap)
 	s.httpLsnr.UpdateRouter(compiledRouter)
+	s.httpLsnr.SetReady(true)
 
 	s.logger.Info("applied configuration snapshot",
 		"version", snap.Version,
@@ -106,10 +112,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 	}()
 
-	s.logger.Info("torana data plane ready",
+	s.logger.Info("torana data plane initialized",
 		"namespace", s.cfg.Namespace,
 		"http_addr", s.cfg.HTTPAddress(),
+		"grpc_addr", s.cfg.GRPCAddress(),
 		"env", s.cfg.Environment,
+		"ready", s.holder.HasSnapshot(),
 	)
 
 	select {
@@ -126,7 +134,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), s.cfg.DrainTimeout)
 	defer drainCancel()
 
-	// 1. Stop HTTP listener
+	// 1. Mark unready & stop HTTP listener
 	if err := s.httpLsnr.Stop(drainCtx); err != nil {
 		s.logger.Error("error stopping http listener", "error", err)
 	}

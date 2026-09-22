@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package plugin.v1;
+
+option go_package = "github.com/phaselume/torana/api/proto/plugin/v1;pluginv1";
+
+// PluginService defines the interface for out-of-process filter plugins.
+service PluginService {
+  // Handshake establishes capability negotiation between data plane and plugin.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  // Describe returns the plugin's declared lifecycle phase and body inspection mode.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // OnRequest evaluates or transforms request headers/metadata and buffered payload.
+  rpc OnRequest(Envelope) returns (Decision);
+
+  // OnResponse evaluates or transforms response headers/metadata and buffered payload.
+  rpc OnResponse(Envelope) returns (Decision);
+
+  // OnChunk streams raw request/response chunks through the plugin for real-time inspection.
+  rpc OnChunk(stream ChunkEnvelope) returns (stream ChunkDecision);
+}
+
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  PHASE_REQUEST_HEADERS = 1;
+  PHASE_REQUEST_BODY = 2;
+  PHASE_RESPONSE_HEADERS = 3;
+  PHASE_RESPONSE_BODY = 4;
+}
+
+enum BodyMode {
+  BODY_MODE_NONE = 0;
+  BODY_MODE_STREAMING = 1;
+  BODY_MODE_BUFFERED = 2;
+}
+
+enum Action {
+  ACTION_CONTINUE = 0;
+  ACTION_HALT = 1;
+  ACTION_MUTATE = 2;
+  ACTION_DROP = 3;
+}
+
+message HandshakeRequest {
+  string gateway_version = 1;
+  string plugin_id = 2;
+  string config_json = 3;
+}
+
+message HandshakeResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+message DescribeRequest {
+  string plugin_id = 1;
+}
+
+message DescribeResponse {
+  string name = 1;
+  string version = 2;
+  Phase phase = 3;
+  BodyMode body_mode = 4;
+  int64 max_buffer_bytes = 5;
+}
+
+// Envelope encapsulates request/response context delivered to a plugin.
+message Envelope {
+  string request_id = 1;
+  string route_id = 2;
+  Phase phase = 3;
+  map<string, string> headers = 4;
+  map<string, string> metadata = 5;
+  bytes body = 6;
+  bool body_eof = 7;
+  PeerInfo peer_info = 8;
+}
+
+message PeerInfo {
+  string remote_ip = 1;
+  string protocol = 2;
+  string client_identity = 3;
+}
+
+// Decision represents the plugin's verdict and any requested mutations.
+message Decision {
+  Action action = 1;
+  int32 status_code = 2; // e.g. 401, 403, 429 when action == ACTION_HALT
+  string reason = 3;
+  map<string, string> mutate_headers = 4;
+  bytes mutate_body = 5;
+  map<string, string> mutate_metadata = 6;
+}
+
+// ChunkEnvelope streams individual body chunks to a streaming plugin.
+message ChunkEnvelope {
+  string request_id = 1;
+  bytes chunk = 2;
+  bool is_last = 3;
+}
+
+// ChunkDecision streams back decisions or transformed chunks.
+message ChunkDecision {
+  Action action = 1;
+  bytes transformed_chunk = 2;
+  string error_reason = 3;
+}

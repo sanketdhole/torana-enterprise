@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 )
 
@@ -16,21 +18,45 @@ func NewChain(filters ...Filter) *Chain {
 	}
 }
 
-// Execute runs all filters in order against the RequestContext.
-// Halts execution on the first error encountered (fail-closed).
-func (c *Chain) Execute(ctx *RequestContext) error {
+// Execute runs all applicable filters for the envelope's current phase.
+// Halts execution on the first error or ActionHalt encountered (fail-closed).
+func (c *Chain) Execute(ctx context.Context, env *Envelope) (Decision, error) {
 	for _, f := range c.filters {
 		select {
-		case <-ctx.Ctx.Done():
-			return ctx.Ctx.Err()
+		case <-ctx.Done():
+			return HaltDecision(504, "context cancelled"), ctx.Err()
 		default:
 		}
 
-		if err := f.Execute(ctx); err != nil {
-			return fmt.Errorf("filter %q failed: %w", f.Name(), err)
+		if f.Phase() != env.Phase {
+			continue
+		}
+
+		decision, err := f.Process(ctx, env)
+		if err != nil {
+			return HaltDecision(500, err.Error()), fmt.Errorf("filter %q failed: %w", f.Name(), err)
+		}
+
+		// Apply mutations if any
+		if decision.Action == ActionMutate {
+			for k, v := range decision.MutateHeaders {
+				env.Headers.Set(k, v)
+			}
+			for k, v := range decision.MutateMetadata {
+				env.Metadata[k] = v
+			}
+			if len(decision.MutateBody) > 0 {
+				env.BufferedBody = decision.MutateBody
+				env.Body = bytes.NewReader(decision.MutateBody)
+			}
+		}
+
+		if decision.Action == ActionHalt || decision.Action == ActionDrop {
+			return decision, nil
 		}
 	}
-	return nil
+
+	return ContinueDecision(), nil
 }
 
 // Filters returns a slice of all configured filters.

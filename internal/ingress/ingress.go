@@ -31,15 +31,15 @@ type Listener interface {
 
 // HTTPListener handles incoming HTTP/1.1 & HTTP/2 ingress traffic.
 type HTTPListener struct {
-	addr       string
-	server     *http.Server
-	holder     *config.SnapshotHolder
-	egressReg  *egress.Registry
-	emitter    *telemetry.Emitter
-	logger     *slog.Logger
-	chain      *pipeline.Chain
-	ready      atomic.Bool
-	routerPtr  atomic.Pointer[router.Router]
+	addr      string
+	server    *http.Server
+	holder    *config.SnapshotHolder
+	egressReg *egress.Registry
+	emitter   *telemetry.Emitter
+	logger    *slog.Logger
+	chain     *pipeline.Chain
+	ready     atomic.Bool
+	routerPtr atomic.Pointer[router.Router]
 }
 
 // NewHTTPListener creates an HTTP ingress listener.
@@ -145,22 +145,38 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Build RequestContext
-	reqCtx := pipeline.NewRequestContext(r.Context(), r.Method, r.URL.Path, r.Header.Clone(), r.Body)
-	reqCtx.Route = match.Route
-	reqCtx.Upstream = match.Upstream
+	// 3. Build Request Envelope
+	env := pipeline.NewEnvelope(
+		r.Header.Get("X-Request-ID"),
+		pipeline.PhaseRequestHeaders,
+		r.Method,
+		r.URL.Path,
+		r.Header.Clone(),
+		r.Body,
+	)
+	env.Route = match.Route
+	env.Upstream = match.Upstream
+	env.PeerInfo = pipeline.PeerInfo{
+		RemoteIP: r.RemoteAddr,
+		Protocol: r.Proto,
+	}
 
 	// 4. Run Filter Chain (authn, authz, ratelimit, etc.)
 	if l.chain != nil {
-		if err := l.chain.Execute(reqCtx); err != nil {
-			status := http.StatusForbidden
-			if errors.Is(err, pipeline.ErrUnauthorized) {
-				status = http.StatusUnauthorized
+		decision, err := l.chain.Execute(r.Context(), env)
+		if err != nil || decision.Action == pipeline.ActionHalt || decision.Action == pipeline.ActionDrop {
+			status := decision.StatusCode
+			if status == 0 {
+				status = http.StatusForbidden
 			}
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), status)
+			msg := decision.Reason
+			if msg == "" && err != nil {
+				msg = err.Error()
+			}
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, msg), status)
 
 			// Emit telemetry event for rejected request
-			l.emitTelemetry(reqCtx, status, time.Since(startTime), err.Error())
+			l.emitTelemetry(env, status, time.Since(startTime), msg)
 			return
 		}
 	}
@@ -169,23 +185,23 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	egressClient, err := l.egressReg.Get(match.Upstream.Protocol)
 	if err != nil {
 		http.Error(w, `{"error":"upstream protocol unsupported"}`, http.StatusBadGateway)
-		l.emitTelemetry(reqCtx, http.StatusBadGateway, time.Since(startTime), err.Error())
+		l.emitTelemetry(env, http.StatusBadGateway, time.Since(startTime), err.Error())
 		return
 	}
 
 	// 6. Execute Egress invocation with streaming body
 	egressReq := &egress.Request{
-		Method:  reqCtx.Method,
-		Path:    reqCtx.Path,
-		Headers: reqCtx.Headers,
-		Body:    reqCtx.RequestBody,
+		Method:  env.Method,
+		Path:    env.Path,
+		Headers: env.Headers,
+		Body:    env.Body,
 		Timeout: match.Route.Timeout,
 	}
 
-	resp, err := egressClient.Execute(reqCtx.Ctx, match.Upstream, egressReq)
+	resp, err := egressClient.Execute(r.Context(), match.Upstream, egressReq)
 	if err != nil {
 		http.Error(w, `{"error":"upstream call failed"}`, http.StatusBadGateway)
-		l.emitTelemetry(reqCtx, http.StatusBadGateway, time.Since(startTime), err.Error())
+		l.emitTelemetry(env, http.StatusBadGateway, time.Since(startTime), err.Error())
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -201,37 +217,37 @@ func (l *HTTPListener) handleGateway(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 
 	// 8. Emit telemetry metadata
-	l.emitTelemetry(reqCtx, resp.StatusCode, time.Since(startTime), "")
+	l.emitTelemetry(env, resp.StatusCode, time.Since(startTime), "")
 }
 
-func (l *HTTPListener) emitTelemetry(reqCtx *pipeline.RequestContext, status int, duration time.Duration, errStr string) {
+func (l *HTTPListener) emitTelemetry(env *pipeline.Envelope, status int, duration time.Duration, errStr string) {
 	if l.emitter == nil {
 		return
 	}
 
 	routeID := ""
 	upstreamID := ""
-	if reqCtx.Route != nil {
-		routeID = reqCtx.Route.ID
+	if env.Route != nil {
+		routeID = env.Route.ID
 	}
-	if reqCtx.Upstream != nil {
-		upstreamID = reqCtx.Upstream.ID
+	if env.Upstream != nil {
+		upstreamID = env.Upstream.ID
 	}
 
-	tenantID, _ := reqCtx.GetMetadata("tenant_id")
-	model, _ := reqCtx.GetMetadata("model")
+	tenantID, _ := env.GetMetadata("tenant_id")
+	model, _ := env.GetMetadata("model")
 
 	l.emitter.Emit(telemetry.Event{
-		Timestamp:  reqCtx.StartTime,
+		Timestamp:  env.StartTime,
 		RouteID:    routeID,
 		UpstreamID: upstreamID,
-		Method:     reqCtx.Method,
-		Path:       reqCtx.Path,
+		Method:     env.Method,
+		Path:       env.Path,
 		StatusCode: status,
 		DurationMs: duration.Milliseconds(),
 		Model:      model,
 		TenantID:   tenantID,
 		Error:      errStr,
-		CustomMeta: reqCtx.Metadata,
+		CustomMeta: env.Metadata,
 	})
 }

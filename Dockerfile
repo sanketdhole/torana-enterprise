@@ -1,35 +1,37 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
+# Build stage: Compile static Go binary
+FROM golang:1.24-alpine AS builder
 
-WORKDIR /app
+WORKDIR /src
 
-# Download dependencies
+# Pre-fetch dependencies
 COPY go.mod ./
-# RUN go mod download (uncomment when external modules are added)
+# RUN go mod download (uncomment when external dependencies are declared)
 
 # Copy source code
 COPY . .
 
-# Build statically linked binary with zero CGO
+# Build statically linked binary with stripped symbols and zero CGO
 ARG VERSION=0.1.0
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w -X main.Version=${VERSION}" -o /app/bin/gateway-data ./cmd/gateway
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w -extldflags '-static' -X main.Version=${VERSION}" \
+    -o /bin/gateway-data ./cmd/gateway-data
 
-# Final stage: minimal secure image
-FROM alpine:3.20
+# Final stage: Distroless static non-root (UID 65532)
+FROM gcr.io/distroless/static-debian12:nonroot
 
-RUN apk --no-cache add ca-certificates tzdata \
-    && addgroup -S gateway && adduser -S gateway -G gateway
-
-USER gateway
 WORKDIR /app
 
-COPY --from=builder /app/bin/gateway-data /app/gateway-data
+# Copy statically linked binary
+COPY --from=builder /bin/gateway-data /app/gateway-data
 
-EXPOSE 8080
+# HTTP ingress and gRPC ingress ports
+EXPOSE 8080 9090
 
-ENV PORT=8080 \
-    HOST=0.0.0.0 \
-    ENV=production \
-    GATEWAY_NAMESPACE=default
+# Default bootstrap environment variables
+ENV LISTEN_HTTP=":8080" \
+    LISTEN_GRPC=":9090" \
+    GATEWAY_NAMESPACE="default" \
+    ENV="production"
 
+# Non-root user is already configured in distroless:nonroot (USER 65532:65532)
 ENTRYPOINT ["/app/gateway-data"]
