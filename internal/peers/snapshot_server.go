@@ -38,7 +38,14 @@ func NewSnapshotServer(cfg Config) (*SnapshotServer, error) {
 	}
 	listenAddr := fmt.Sprintf("%s:%d", bindAddr, cfg.PeerServicePort)
 
-	listener, err := net.Listen("tcp", listenAddr)
+	var listener net.Listener
+	for attempts := 0; attempts < 5; attempts++ {
+		listener, err = net.Listen("tcp", listenAddr)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s for snapshot server: %w", listenAddr, err)
 	}

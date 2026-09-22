@@ -1,4 +1,4 @@
-.PHONY: all build test bench lint vet proto clean docker-build mockplatform
+.PHONY: all build test bench lint vet proto clean docker-build mockplatform fuzz chaos bench-load profile
 
 VERSION ?= 0.1.0-dev
 BIN_DIR = bin
@@ -20,6 +20,25 @@ test:
 
 bench:
 	$(GO) test -bench=. -benchmem -count=1 ./...
+
+bench-load:
+	$(GO) test -bench=. -benchmem -count=3 -timeout 300s ./test/bench/...
+
+profile:
+	$(GO) test -run TestProfile -count=1 -timeout 120s ./test/bench/...
+
+fuzz:
+	@echo "Fuzzing router..."
+	$(GO) test -fuzz=FuzzRouterMatch -fuzztime=30s ./test/fuzz/
+	@echo "Fuzzing CEL compiler..."
+	$(GO) test -fuzz=FuzzCELCompile -fuzztime=30s ./test/fuzz/
+	@echo "Fuzzing JWT parser..."
+	$(GO) test -fuzz=FuzzJWTValidateToken -fuzztime=30s ./test/fuzz/
+	@echo "Fuzzing MCP JSON-RPC parser..."
+	$(GO) test -fuzz=FuzzMCPParseRequest -fuzztime=30s ./test/fuzz/
+
+chaos:
+	$(GO) test -v -race -timeout 120s ./test/chaos/...
 
 vet:
 	$(GO) vet ./...
@@ -46,6 +65,7 @@ proto:
 
 clean:
 	rm -rf $(BIN_DIR)
+	rm -rf test/bench/out
 
 docker-build:
 	docker build -t gateway-data:$(VERSION) -t gateway-data:latest .

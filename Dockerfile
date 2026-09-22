@@ -24,6 +24,9 @@ WORKDIR /app
 # Copy statically linked binary
 COPY --from=builder /bin/gateway-data /app/gateway-data
 
+# Copy entrypoint script for GOMEMLIMIT auto-configuration
+COPY scripts/entrypoint.sh /app/entrypoint.sh
+
 # HTTP ingress and gRPC ingress ports
 EXPOSE 8080 9090
 
@@ -31,7 +34,8 @@ EXPOSE 8080 9090
 ENV LISTEN_HTTP=":8080" \
     LISTEN_GRPC=":9090" \
     GATEWAY_NAMESPACE="default" \
-    ENV="production"
+    ENV="production" \
+    GOMEMLIMIT="0"
 
 # Non-root user is already configured in distroless:nonroot (USER 65532:65532)
-ENTRYPOINT ["/app/gateway-data"]
+ENTRYPOINT ["/app/entrypoint.sh"]

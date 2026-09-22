@@ -40,10 +40,13 @@ type AuditEvent struct {
 // On overflow the oldest unread event is silently dropped and the drop counter
 // is incremented.
 type RingBuffer struct {
+	mu       sync.Mutex
 	buf      []AuditEvent
-	mask     uint64
-	head     atomic.Uint64 // next write position
-	tail     atomic.Uint64 // next read position
+	mask     int
+	head     int
+	tail     int
+	count    int
+	cap      int
 	dropped  atomic.Uint64
 	enqueued atomic.Uint64
 }
@@ -51,60 +54,61 @@ type RingBuffer struct {
 // NewRingBuffer creates a ring buffer whose capacity is rounded up to the next
 // power of two (minimum 64).
 func NewRingBuffer(minCap int) *RingBuffer {
-	cap := uint64(64)
-	for cap < uint64(minCap) {
-		cap <<= 1
+	capacity := 64
+	for capacity < minCap {
+		capacity <<= 1
 	}
 	return &RingBuffer{
-		buf:  make([]AuditEvent, cap),
-		mask: cap - 1,
+		buf:  make([]AuditEvent, capacity),
+		mask: capacity - 1,
+		cap:  capacity,
 	}
 }
 
 // Enqueue appends an event without blocking. Returns false if the buffer is
 // full (the event is dropped).
 func (rb *RingBuffer) Enqueue(ev AuditEvent) bool {
-	for {
-		head := rb.head.Load()
-		tail := rb.tail.Load()
-		if head-tail > rb.mask {
-			// Buffer full — drop
-			rb.dropped.Add(1)
-			return false
-		}
-		if rb.head.CompareAndSwap(head, head+1) {
-			rb.buf[head&rb.mask] = ev
-			rb.enqueued.Add(1)
-			return true
-		}
-		// CAS failed — retry
+	rb.mu.Lock()
+	if rb.count >= rb.cap {
+		rb.mu.Unlock()
+		rb.dropped.Add(1)
+		return false
 	}
+	rb.buf[rb.head] = ev
+	rb.head = (rb.head + 1) & rb.mask
+	rb.count++
+	rb.enqueued.Add(1)
+	rb.mu.Unlock()
+	return true
 }
 
 // Dequeue removes the oldest event. Returns (event, true) or (zero, false) if
 // the buffer is empty.
 func (rb *RingBuffer) Dequeue() (AuditEvent, bool) {
-	for {
-		tail := rb.tail.Load()
-		head := rb.head.Load()
-		if tail >= head {
-			return AuditEvent{}, false
-		}
-		ev := rb.buf[tail&rb.mask]
-		if rb.tail.CompareAndSwap(tail, tail+1) {
-			return ev, true
-		}
+	rb.mu.Lock()
+	if rb.count == 0 {
+		rb.mu.Unlock()
+		return AuditEvent{}, false
 	}
+	ev := rb.buf[rb.tail]
+	rb.buf[rb.tail] = AuditEvent{} // zero out for GC
+	rb.tail = (rb.tail + 1) & rb.mask
+	rb.count--
+	rb.mu.Unlock()
+	return ev, true
 }
 
 // Len returns the current number of buffered events.
 func (rb *RingBuffer) Len() int {
-	head := rb.head.Load()
-	tail := rb.tail.Load()
-	if head >= tail {
-		return int(head - tail)
-	}
-	return 0
+	rb.mu.Lock()
+	n := rb.count
+	rb.mu.Unlock()
+	return n
+}
+
+// Cap returns the capacity of the ring buffer.
+func (rb *RingBuffer) Cap() int {
+	return rb.cap
 }
 
 // DroppedCount returns total events dropped due to saturation.
